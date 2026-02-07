@@ -12,19 +12,6 @@ try:
     from faster_whisper import WhisperModel
 except Exception:  # pragma: no cover
     WhisperModel = None
-import argparse
-import json
-import os
-import re
-import subprocess
-from typing import Any, Dict, List, Optional
-
-from tqdm import tqdm
-
-try:
-    from faster_whisper import WhisperModel
-except Exception:  # pragma: no cover
-    WhisperModel = None
 
 from vc_utils import (
     ensure_ffmpeg,

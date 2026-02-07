@@ -2,6 +2,8 @@
 
 多视频语音克隆全流程工具集：转写 → 说话人聚类 → 按人拆分训练集 → XTTS 微调。
 
+**存储优化**：整个流程不保存中间 wav 文件，只在最终训练时才按需切出所需 person 的 wav。
+
 ## 完整 Pipeline（推荐顺序）
 
 ```
@@ -10,20 +12,22 @@ videos/                     whisperVideo.py transcribe
 │   ├── 001.mp4             out/segments/<video>.json   (每视频一个，含 utt_id)
 │   └── 002.mov             out/srts/<video>.srt
 └── 003.mkv                      ↓
-                            export_embedding_dataset.py
+                            export_embedding_dataset.py      ← 不保存 wav
                                  ↓
-                            emb_dataset/manifest.jsonl  (每句：utt_id+路径+时间)
-                            emb_dataset/wavs/<utt_id>.wav
+                            emb_dataset/manifest.jsonl       (元数据引用)
                                  ↓
-                            cluster_speakers.py
+                            cluster_speakers.py              ← 从视频按需计算 embedding
                                  ↓
-                            people/utt2person.json      (utt_id → person_XXX)
-                            people/clusters_detail.jsonl (可人工审查)
-                            people/person_000/{wavs/, metadata.csv}
-                            people/person_001/{wavs/, metadata.csv}
+                            emb_dataset/embeddings.npz       (缓存，后续跳过)
+                            people/utt2person.json
+                            people/clusters_detail.jsonl     (可人工审查)
+                            people/person_000/segments.jsonl  ← 仅引用，不含 wav
+                            people/person_001/segments.jsonl
                                  ↓
-                            train_xtts.py
+                            train_xtts.py                    ← 自动从视频按需切 wav
                                  ↓
+                            people/person_000/wavs/*.wav     (此时才落盘)
+                            people/person_000/metadata.csv
                             xtts_run/metadata_train.csv
                             xtts_run/metadata_eval.csv
                             xtts_run/train_command.sh
@@ -33,7 +37,7 @@ videos/                     whisperVideo.py transcribe
 
 ```bash
 # 基础（必需）
-pip install numpy scipy soundfile librosa tqdm ffmpeg-python
+pip install numpy scipy soundfile tqdm
 
 # Whisper 转写（二选一）
 pip install faster-whisper          # 推荐
@@ -75,54 +79,66 @@ python3 whisperVideo.py transcribe \
   --language ja
 ```
 
-## Step 2) 导出 embedding 数据集
+## Step 2) 导出 manifest（元数据引用，不保存 wav）
 
 脚本：`export_embedding_dataset.py`
 - 输入：Step 1 的 `out/segments`
-- 输出：`emb_dataset/wavs/<utt_id>.wav`（16kHz）+ `emb_dataset/manifest.jsonl`
+- 输出：`emb_dataset/manifest.jsonl`（每句：utt_id + 视频路径 + 时间戳 + 文本）
+- **不切分/不保存任何 wav 文件**
 
 ```bash
 python3 export_embedding_dataset.py \
   --segments_dir out/segments \
-  --out_dir emb_dataset \
-  --sr 16000
+  --out_dir emb_dataset
 ```
 
-## Step 3) 说话人聚类 → 按人生成训练目录
+## Step 3) 说话人聚类 → 按人生成引用目录
 
 脚本：`cluster_speakers.py`
 - 方案：**speechbrain ECAPA-TDNN** 声纹 + **Agglomerative Clustering**（cosine）
+- **Embedding 直接从原始视频按需计算**（按视频分组，每个视频只 ffmpeg 一次）
+- 结果缓存到 `embeddings.npz`，后续重跑自动跳过
 - 自动检测人数（silhouette score），也可手动指定 `--n_speakers`
 - 输出：
   - `people/utt2person.json`：`{utt_id: "person_000", ...}`
   - `people/clusters_detail.jsonl`：含视频路径+时间+文本，可人工审查/修正
-  - `people/person_XXX/wavs/*.wav` + `people/person_XXX/metadata.csv`
+  - `people/person_XXX/segments.jsonl`：**仅元数据引用，不含 wav**
 
 ```bash
-# 自动检测人数
+# 自动检测人数（默认不导出 wav）
 python3 cluster_speakers.py \
   --emb_dir emb_dataset \
   --out_dir people \
-  --dataset_sr 22050
+  --device mps
 
-# 或手动指定 3 个人
+# 手动指定 3 个人
 python3 cluster_speakers.py \
   --emb_dir emb_dataset \
   --out_dir people \
   --n_speakers 3 \
+  --device mps
+
+# 如果想立即导出某人的 wav（也可在 train_xtts.py 时自动切）
+python3 cluster_speakers.py \
+  --emb_dir emb_dataset \
+  --out_dir people \
+  --export_wavs --person person_000 \
   --dataset_sr 22050
 ```
 
 ## Step 4) XTTS 微调训练
 
 脚本：`train_xtts.py`
-- 输入：Step 3 的某个 person 目录（或 Step 2B 的 dataset）
+- 输入：Step 3 的某个 person 目录（含 `segments.jsonl`）
+- **自动检测**：如果 `wavs/` 不存在但有 `segments.jsonl`，会自动从原始视频按需切出 wav
 - 输出：train/eval 拆分 + 训练命令模板
 
 ```bash
+# 直接指定 person 目录，wav 会自动切出
 python3 train_xtts.py \
   --dataset_dir people/person_000 \
   --out_dir xtts_run \
+  --dataset_sr 22050 \
   --print_only
 ```
 
@@ -159,4 +175,19 @@ export HF_TOKEN=xxxxx
 python3 diarize_segments.py \
   --segments_json out/segments/xxx.json \
   --out_json out/segments_diarized/xxx.json
+```
+
+### example
+```bash
+# ① 转写（每视频一个 JSON + SRT）
+python3 whisperVideo.py transcribe --input /Users/apple/Desktop/videos --out_dir out --language ja --backend whisper-cli --whisper_cli_model /Users/apple/models/ggml-base.bin
+
+# ② 导出 manifest（仅元数据，不保存 wav）
+python3 export_embedding_dataset.py --segments_dir out/segments --out_dir emb_dataset
+
+# ③ 聚类 → 按人生成引用目录（embedding 从视频按需计算，不保存 wav）
+python3 cluster_speakers.py --emb_dir emb_dataset --out_dir people --device mps
+
+# ④ 挑一个人开始训练（自动从视频切 wav）
+python3 train_xtts.py --dataset_dir people/person_000 --out_dir xtts_run --dataset_sr 22050 --print_only
 ```

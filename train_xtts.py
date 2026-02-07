@@ -1,9 +1,17 @@
 import argparse
+import csv
+import json
 import os
 import random
 import shutil
 import subprocess
-from typing import List, Tuple
+from collections import defaultdict
+from typing import Dict, List, Tuple
+
+import soundfile as sf
+from tqdm import tqdm
+
+from vc_utils import ensure_ffmpeg, extract_audio
 
 
 def read_lines(path: str) -> List[str]:
@@ -28,6 +36,76 @@ def split_metadata(lines: List[str], eval_ratio: float, seed: int) -> Tuple[List
     for i, ln in enumerate(lines):
         (eval_lines if i in eval_set else train_lines).append(ln)
     return train_lines, eval_lines
+
+
+def _ensure_wavs(dataset_dir: str, dataset_sr: int, min_dur: float = 1.0, max_dur: float = 15.0) -> None:
+    """当 dataset_dir 有 segments.jsonl 但没有 wavs/ 时，自动从原始视频按需切出 wav + metadata.csv。"""
+    wavs_dir = os.path.join(dataset_dir, "wavs")
+    metadata_path = os.path.join(dataset_dir, "metadata.csv")
+    segments_path = os.path.join(dataset_dir, "segments.jsonl")
+
+    if os.path.isdir(wavs_dir) and os.path.isfile(metadata_path):
+        return  # 已有 wavs + metadata，无需重建
+
+    if not os.path.isfile(segments_path):
+        return  # 没有 segments.jsonl，无法自动切
+
+    print(f"🔧 Auto-cutting wavs from segments.jsonl → {wavs_dir}")
+    ensure_ffmpeg()
+    os.makedirs(wavs_dir, exist_ok=True)
+
+    rows: List[Dict] = []
+    with open(segments_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                rows.append(json.loads(line))
+
+    if not rows:
+        raise RuntimeError(f"{segments_path} 为空")
+
+    # 按视频分组
+    by_video: Dict[str, List[Dict]] = defaultdict(list)
+    for r in rows:
+        by_video[r["video_abs"]].append(r)
+
+    metadata_rows: List[List[str]] = []
+
+    for video_abs, utts in tqdm(by_video.items(), desc="Cutting wavs"):
+        tmp_wav = os.path.join(dataset_dir, ".tmp_full.wav")
+        try:
+            extract_audio(video_abs, tmp_wav, sample_rate=dataset_sr, mono=True)
+            audio, sr = sf.read(tmp_wav)
+        except Exception as e:
+            print(f"⚠️  无法读取 {video_abs}: {e}")
+            continue
+        finally:
+            try:
+                os.remove(tmp_wav)
+            except OSError:
+                pass
+
+        for r in utts:
+            dur = float(r.get("duration", float(r["end"]) - float(r["start"])))
+            if dur < min_dur or dur > max_dur:
+                continue
+
+            start_i = int(float(r["start"]) * sr)
+            end_i = int(float(r["end"]) * sr)
+            if end_i <= start_i:
+                continue
+
+            clip = audio[start_i:end_i]
+            utt_id = r["utt_id"]
+            wav_name = f"{utt_id}.wav"
+            sf.write(os.path.join(wavs_dir, wav_name), clip, sr)
+            metadata_rows.append([wav_name, str(r.get("text", "")).strip()])
+
+    with open(metadata_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f, delimiter="|")
+        writer.writerows(metadata_rows)
+
+    print(f"   ✅ Cut {len(metadata_rows)} wavs → {wavs_dir}")
 
 
 def main() -> None:
@@ -67,7 +145,16 @@ def main() -> None:
         action="store_true",
         help="只生成拆分文件和命令模板，不尝试运行训练",
     )
+    parser.add_argument(
+        "--dataset_sr",
+        type=int,
+        default=22050,
+        help="自动切 wav 时的采样率（XTTS 推荐 22050/24000）",
+    )
     args = parser.parse_args()
+
+    # 如果有 segments.jsonl 但没有 wavs/，自动按需切出 wav
+    _ensure_wavs(args.dataset_dir, args.dataset_sr)
 
     metadata = os.path.join(args.dataset_dir, "metadata.csv")
     wavs_dir = os.path.join(args.dataset_dir, "wavs")

@@ -6,30 +6,40 @@
   - 可手动指定人数 (--n_speakers)
   - 也可自动检测 (silhouette score)
 
+**存储优化**：整个流程不保存中间 wav 文件。
+- Embedding 直接从原始视频按需提取音频计算（按视频分组，每个视频只 ffmpeg 一次）。
+- 聚类后默认只生成 segments.jsonl（元数据引用），不切 wav。
+- 加 --export_wavs 才会为指定或全部 person 导出训练用 wav。
+
 依赖:
-  pip install speechbrain torch torchaudio scikit-learn numpy
+  pip install speechbrain torch torchaudio scikit-learn numpy soundfile
 
 用法:
-  # 1) 先生成 embedding 数据集
+  # 1) 先生成 manifest（不保存 wav）
   python3 export_embedding_dataset.py --segments_dir out/segments --out_dir emb_dataset
 
-  # 2) 聚类并生成按人训练目录
-  python3 cluster_speakers.py --emb_dir emb_dataset --out_dir people
+  # 2) 聚类（embedding 从视频按需计算，结果缓存到 embeddings.npz）
+  python3 cluster_speakers.py --emb_dir emb_dataset --out_dir people --device mps
 
-  # 3) 用某个人的数据训练
-  python3 train_xtts.py --dataset_dir people/person_000 --out_dir xtts_run
+  # 3) 训练时再导出某个人的 wav
+  python3 cluster_speakers.py --emb_dir emb_dataset --out_dir people --export_wavs --person person_000
 """
 
 import argparse
 import csv
 import json
 import os
+import warnings
 from collections import defaultdict
 from typing import Dict, List, Optional
 
 import numpy as np
 import soundfile as sf
+import torch
 from tqdm import tqdm
+
+# PyTorch 2.10+ 的 stft resize 警告，不影响计算结果
+warnings.filterwarnings("ignore", message=".*An output with one or more elements was resized.*")
 
 from vc_utils import ensure_ffmpeg, extract_audio
 
@@ -49,11 +59,42 @@ def load_manifest(path: str) -> List[Dict]:
 
 
 # ---------------------------------------------------------------------------
-# 2) Embedding（ECAPA-TDNN via speechbrain）
+# 2) Embedding（ECAPA-TDNN via speechbrain）— 从原始视频按需提取
 # ---------------------------------------------------------------------------
 
 def _load_encoder(device: str, model_source: str):
     """兼容 speechbrain >=1.0 和 <1.0 两种 import 路径。"""
+    # ── monkey-patch 1: torchaudio >=2.10 移除了 list_audio_backends，
+    #    但 speechbrain 1.0.x 初始化时仍会调用它 ─────────────────
+    import torchaudio
+    if not hasattr(torchaudio, "list_audio_backends"):
+        torchaudio.list_audio_backends = lambda: ["ffmpeg"]
+
+    # ── monkey-patch 2: huggingface_hub 新版移除了 use_auth_token 参数，
+    #    且 404 异常类型从 HTTPError 变为 RemoteEntryNotFoundError，
+    #    但 speechbrain 1.0.x 的 fetch 仍依赖旧行为 ──────────────
+    import huggingface_hub as _hf
+    _orig_download = _hf.hf_hub_download
+    import functools
+    from requests import HTTPError as _HTTPError  # speechbrain fetch 期望捕获这个
+
+    @functools.wraps(_orig_download)
+    def _patched_download(*args, **kwargs):
+        if "use_auth_token" in kwargs:
+            kwargs["token"] = kwargs.pop("use_auth_token")
+        # 新版抛 RemoteEntryNotFoundError 等, 转成旧版 HTTPError
+        # 以便 speechbrain fetch→except HTTPError→raise ValueError 链条正常工作
+        if "force_filename" in kwargs:
+            kwargs.pop("force_filename")  # 新版也移除了这个参数
+        try:
+            return _orig_download(*args, **kwargs)
+        except Exception as e:
+            if "404" in str(e) or "EntryNotFound" in type(e).__name__:
+                raise _HTTPError(f"404 Client Error: {e}") from e
+            raise
+
+    _hf.hf_hub_download = _patched_download
+
     try:
         from speechbrain.inference.speaker import EncoderClassifier
     except ImportError:
@@ -72,28 +113,85 @@ def _load_encoder(device: str, model_source: str):
     return classifier
 
 
+_EMB_SR = 16000  # ECAPA-TDNN 期望 16 kHz
+
+
 def compute_embeddings(
     manifest: List[Dict],
-    emb_dir: str,
+    cache_dir: str,
     *,
     device: str = "cpu",
     model_source: str = "speechbrain/spkrec-ecapa-voxceleb",
+    batch_size: int = 64,
 ) -> Dict[str, np.ndarray]:
-    """为每条 utterance 计算 192 维 ECAPA-TDNN 声纹向量。"""
+    """为每条 utterance 计算 192 维 ECAPA-TDNN 声纹向量。
+
+    **不保存任何 wav 文件**：按 video_abs 分组，每个视频用 ffmpeg 提取一次
+    完整 16 kHz 音频到临时文件 → 在内存中切片 → 批量计算 embedding → 删除临时文件。
+    """
     classifier = _load_encoder(device, model_source)
 
+    # 按视频分组，同一视频只提取一次完整音频
+    by_video: Dict[str, List[Dict]] = defaultdict(list)
+    for row in manifest:
+        by_video[row["video_abs"]].append(row)
+
+    os.makedirs(cache_dir, exist_ok=True)
+    tmp_wav = os.path.join(cache_dir, "_tmp_emb.wav")
+
     embeddings: Dict[str, np.ndarray] = {}
-    for row in tqdm(manifest, desc="Computing embeddings"):
-        utt_id = row["utt_id"]
-        audio_path = os.path.join(emb_dir, row["audio"])
-        if not os.path.exists(audio_path):
-            continue
+
+    for video_abs, rows in tqdm(by_video.items(), desc="Computing embeddings (by video)"):
+        # 提取完整音频到临时文件
         try:
-            signal = classifier.load_audio(audio_path)
-            emb = classifier.encode_batch(signal.unsqueeze(0))
-            embeddings[utt_id] = emb.squeeze().cpu().numpy()
+            extract_audio(video_abs, tmp_wav, sample_rate=_EMB_SR, mono=True)
+            audio, sr = sf.read(tmp_wav)
         except Exception as e:
-            print(f"⚠️  {utt_id}: embedding 失败 ({e})")
+            print(f"⚠️  无法读取 {video_abs}: {e}")
+            continue
+        finally:
+            try:
+                os.remove(tmp_wav)
+            except OSError:
+                pass
+
+        # 收集本视频所有有效片段
+        clips: List[tuple] = []  # (utt_id, signal_tensor)
+        for row in rows:
+            utt_id = row["utt_id"]
+            start_i = int(float(row["start"]) * sr)
+            end_i = int(float(row["end"]) * sr)
+            if end_i <= start_i:
+                continue
+            clip = audio[start_i:end_i]
+            clips.append((utt_id, torch.tensor(clip, dtype=torch.float32)))
+
+        # 分批送入模型（batch 推理远快于逐条）
+        for i in range(0, len(clips), batch_size):
+            batch = clips[i : i + batch_size]
+            uids = [c[0] for c in batch]
+            signals = [c[1] for c in batch]
+
+            # 对齐到同一长度（pad 到 batch 内最长）
+            max_len = max(s.shape[0] for s in signals)
+            padded = torch.zeros(len(signals), max_len)
+            lengths = torch.zeros(len(signals))
+            for j, s in enumerate(signals):
+                padded[j, : s.shape[0]] = s
+                lengths[j] = s.shape[0] / max_len
+
+            try:
+                embs = classifier.encode_batch(padded, lengths)  # (B, 1, 192)
+                for j, uid in enumerate(uids):
+                    embeddings[uid] = embs[j].squeeze().cpu().numpy()
+            except Exception as e:
+                # 批量失败时回退到逐条
+                for j, uid in enumerate(uids):
+                    try:
+                        emb = classifier.encode_batch(signals[j].unsqueeze(0))
+                        embeddings[uid] = emb.squeeze().cpu().numpy()
+                    except Exception as e2:
+                        print(f"⚠️  {uid}: embedding 失败 ({e2})")
 
     return embeddings
 
@@ -109,13 +207,17 @@ def cluster_embeddings(
     min_speakers: int = 2,
     max_speakers: int = 10,
 ) -> Dict[str, str]:
-    """Agglomerative clustering（cosine distance）。
+    """Spectral Clustering on cosine-similarity affinity matrix.
 
-    n_speakers=None 时自动用 silhouette score 选最优 k。
+    对句子级 embedding 先做 L2 归一化，构建 cosine similarity 亲和矩阵，
+    然后用 Spectral Clustering（比 Agglomerative 更擅长处理高维、
+    方差大、簇大小不均匀的场景）。
+
+    n_speakers=None 时自动用多指标（calinski-harabasz + davies-bouldin）选最优 k。
     返回 {utt_id: "person_000", ...}。
     """
-    from sklearn.cluster import AgglomerativeClustering
-    from sklearn.metrics import silhouette_score
+    from sklearn.cluster import SpectralClustering, KMeans
+    from sklearn.metrics import calinski_harabasz_score, davies_bouldin_score
     from sklearn.preprocessing import normalize
 
     utt_ids = list(embeddings.keys())
@@ -125,46 +227,57 @@ def cluster_embeddings(
         return {utt_ids[0]: "person_000"}
 
     X = np.array([embeddings[uid] for uid in utt_ids])
-    X = normalize(X)  # L2 normalize → cosine similarity
+    X = normalize(X)  # L2 normalize
+
+    # 构建 cosine similarity 亲和矩阵（clip 到 [0, 1]）
+    affinity = np.clip(X @ X.T, 0, 1)
+
+    def _spectral(n_k: int) -> np.ndarray:
+        sc = SpectralClustering(
+            n_clusters=n_k,
+            affinity="precomputed",
+            assign_labels="kmeans",
+            random_state=42,
+            n_init=10,
+        )
+        return sc.fit_predict(affinity)
 
     if n_speakers is not None:
         n_k = min(n_speakers, len(utt_ids))
-        model = AgglomerativeClustering(
-            n_clusters=n_k,
-            metric="cosine",
-            linkage="average",
-        )
-        labels = model.fit_predict(X)
-        print(f"Clustering into {n_k} speakers (user-specified)")
+        labels = _spectral(n_k)
+        counts = sorted(np.bincount(labels).tolist(), reverse=True)
+        print(f"Clustering into {n_k} speakers (user-specified), sizes={counts}")
     else:
         max_k = min(max_speakers, len(utt_ids) - 1)
         if max_k < min_speakers:
             return {uid: "person_000" for uid in utt_ids}
 
         best_k = min_speakers
-        best_score = -1.0
+        best_combined = -1e9
+        results: Dict[int, np.ndarray] = {}
 
+        print(f"🔍 Searching best k in [{min_speakers}, {max_k}]...")
         for k in range(min_speakers, max_k + 1):
-            model = AgglomerativeClustering(
-                n_clusters=k,
-                metric="cosine",
-                linkage="average",
-            )
-            lbl = model.fit_predict(X)
+            lbl = _spectral(k)
+            results[k] = lbl
+
             if len(set(lbl)) < 2:
                 continue
-            score = silhouette_score(X, lbl, metric="cosine")
-            if score > best_score:
-                best_score = score
+
+            # CH 越大越好，DB 越小越好 → 用 CH - DB*1000 作为综合指标
+            ch = calinski_harabasz_score(X, lbl)
+            db = davies_bouldin_score(X, lbl)
+            combined = ch - db * 1000
+            counts = sorted(np.bincount(lbl).tolist(), reverse=True)
+            print(f"   k={k:2d}  CH={ch:.1f}  DB={db:.3f}  combined={combined:.1f}  sizes={counts}")
+
+            if combined > best_combined:
+                best_combined = combined
                 best_k = k
 
-        model = AgglomerativeClustering(
-            n_clusters=best_k,
-            metric="cosine",
-            linkage="average",
-        )
-        labels = model.fit_predict(X)
-        print(f"🔍 Auto-detected {best_k} speakers (silhouette={best_score:.3f})")
+        labels = results[best_k]
+        counts = sorted(np.bincount(labels).tolist(), reverse=True)
+        print(f"🔍 Auto-detected {best_k} speakers, sizes={counts}")
 
     utt2person: Dict[str, str] = {}
     for uid, lbl in zip(utt_ids, labels):
@@ -174,21 +287,16 @@ def cluster_embeddings(
 
 
 # ---------------------------------------------------------------------------
-# 4) 按人生成训练目录
+# 4) 按人生成 segments.jsonl（元数据引用，不保存 wav）
 # ---------------------------------------------------------------------------
 
-def build_per_person_dirs(
+def build_per_person_refs(
     utt2person: Dict[str, str],
     manifest: List[Dict],
     out_dir: str,
-    *,
-    dataset_sr: int = 22050,
-    min_dur: float = 1.0,
-    max_dur: float = 15.0,
 ) -> None:
-    """为每个 person 生成 people/<person>/wavs + metadata.csv（可直接喂 XTTS）。"""
+    """为每个 person 生成 people/<person>/segments.jsonl（仅元数据引用）。"""
 
-    # 按 person 分组
     person_utts: Dict[str, List[Dict]] = defaultdict(list)
     for row in manifest:
         uid = row["utt_id"]
@@ -196,64 +304,101 @@ def build_per_person_dirs(
         if person:
             person_utts[person].append(row)
 
-    for person, rows in tqdm(sorted(person_utts.items()), desc="Building per-person dirs"):
+    for person, rows in sorted(person_utts.items()):
         person_dir = os.path.join(out_dir, person)
-        wavs_dir = os.path.join(person_dir, "wavs")
-        os.makedirs(wavs_dir, exist_ok=True)
+        os.makedirs(person_dir, exist_ok=True)
 
-        # 按视频分组（同一视频只提取一次完整音频）
-        by_video: Dict[str, List[Dict]] = defaultdict(list)
-        for r in rows:
-            by_video[r["video_abs"]].append(r)
+        seg_path = os.path.join(person_dir, "segments.jsonl")
+        with open(seg_path, "w", encoding="utf-8") as f:
+            for r in rows:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
-        metadata_rows: List[List[str]] = []
+    # 打印摘要
+    print("\n📊 Per-person summary (reference only, no wavs):")
+    for person in sorted(person_utts):
+        print(f"   {person}: {len(person_utts[person])} utterances")
 
-        for video_abs, utts in by_video.items():
-            tmp_wav = os.path.join(person_dir, ".tmp_full.wav")
-            try:
-                extract_audio(video_abs, tmp_wav, sample_rate=dataset_sr, mono=True)
-                audio, sr = sf.read(tmp_wav)
-            except Exception as e:
-                print(f"⚠️  无法读取 {video_abs}: {e}")
-                continue
 
-            for r in utts:
-                dur = float(r["duration"])
-                if dur < min_dur or dur > max_dur:
-                    continue
+# ---------------------------------------------------------------------------
+# 5) 按需导出某个 person 的 wav（训练前调用）
+# ---------------------------------------------------------------------------
 
-                start_i = int(float(r["start"]) * sr)
-                end_i = int(float(r["end"]) * sr)
-                if end_i <= start_i:
-                    continue
+def export_person_wavs(
+    person_dir: str,
+    *,
+    dataset_sr: int = 22050,
+    min_dur: float = 1.0,
+    max_dur: float = 15.0,
+) -> None:
+    """从 person 目录的 segments.jsonl 按需切出 wav + metadata.csv（可喂 XTTS）。"""
 
-                clip = audio[start_i:end_i]
-                utt_id = r["utt_id"]
-                wav_name = f"{utt_id}.wav"
-                sf.write(os.path.join(wavs_dir, wav_name), clip, sr)
-                metadata_rows.append([wav_name, str(r.get("text", "")).strip()])
+    seg_path = os.path.join(person_dir, "segments.jsonl")
+    if not os.path.exists(seg_path):
+        raise RuntimeError(f"找不到 {seg_path}")
 
+    rows: List[Dict] = []
+    with open(seg_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                rows.append(json.loads(line))
+
+    if not rows:
+        print(f"⚠️  {seg_path} 为空，跳过")
+        return
+
+    wavs_dir = os.path.join(person_dir, "wavs")
+    os.makedirs(wavs_dir, exist_ok=True)
+
+    # 按视频分组
+    by_video: Dict[str, List[Dict]] = defaultdict(list)
+    for r in rows:
+        by_video[r["video_abs"]].append(r)
+
+    metadata_rows: List[List[str]] = []
+
+    for video_abs, utts in tqdm(by_video.items(), desc=f"Exporting wavs ({os.path.basename(person_dir)})"):
+        tmp_wav = os.path.join(person_dir, ".tmp_full.wav")
+        try:
+            extract_audio(video_abs, tmp_wav, sample_rate=dataset_sr, mono=True)
+            audio, sr = sf.read(tmp_wav)
+        except Exception as e:
+            print(f"⚠️  无法读取 {video_abs}: {e}")
+            continue
+        finally:
             try:
                 os.remove(tmp_wav)
             except OSError:
                 pass
 
-        # 写 metadata.csv（LJSpeech / XTTS 兼容格式：name|text）
-        meta_path = os.path.join(person_dir, "metadata.csv")
-        with open(meta_path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f, delimiter="|")
-            writer.writerows(metadata_rows)
+        for r in utts:
+            dur = float(r["duration"])
+            if dur < min_dur or dur > max_dur:
+                continue
 
-    # 打印摘要
-    print("\n📊 Per-person summary:")
-    for person in sorted(person_utts):
-        p_wavs = os.path.join(out_dir, person, "wavs")
-        n = len([f for f in os.listdir(p_wavs) if f.endswith(".wav")]) if os.path.isdir(p_wavs) else 0
-        print(f"   {person}: {n} utterances")
+            start_i = int(float(r["start"]) * sr)
+            end_i = int(float(r["end"]) * sr)
+            if end_i <= start_i:
+                continue
+
+            clip = audio[start_i:end_i]
+            utt_id = r["utt_id"]
+            wav_name = f"{utt_id}.wav"
+            sf.write(os.path.join(wavs_dir, wav_name), clip, sr)
+            metadata_rows.append([wav_name, str(r.get("text", "")).strip()])
+
+    # 写 metadata.csv（LJSpeech / XTTS 兼容格式：name|text）
+    meta_path = os.path.join(person_dir, "metadata.csv")
+    with open(meta_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f, delimiter="|")
+        writer.writerows(metadata_rows)
+
+    n_wavs = len([f for f in os.listdir(wavs_dir) if f.endswith(".wav")])
+    print(f"   ✅ {os.path.basename(person_dir)}: exported {n_wavs} wav files → {wavs_dir}")
 
 
 # ---------------------------------------------------------------------------
-# 5) CLI
+# 6) CLI
 # ---------------------------------------------------------------------------
 
 def main() -> None:
@@ -263,7 +408,7 @@ def main() -> None:
     parser.add_argument(
         "--emb_dir",
         required=True,
-        help="export_embedding_dataset.py 的输出目录（含 manifest.jsonl 和 wavs/）",
+        help="export_embedding_dataset.py 的输出目录（含 manifest.jsonl）",
     )
     parser.add_argument("--out_dir", default="people", help="输出目录")
     parser.add_argument(
@@ -273,7 +418,7 @@ def main() -> None:
         help="说话人数量；留空则自动检测",
     )
     parser.add_argument("--max_speakers", type=int, default=10, help="自动检测时尝试的最大人数")
-    parser.add_argument("--dataset_sr", type=int, default=22050, help="训练集采样率（XTTS 推荐 22050/24000）")
+    parser.add_argument("--dataset_sr", type=int, default=22050, help="导出 wav 采样率（XTTS 推荐 22050/24000）")
     parser.add_argument("--min_dur", type=float, default=1.0, help="最短句子（秒）")
     parser.add_argument("--max_dur", type=float, default=15.0, help="最长句子（秒）")
     parser.add_argument("--device", default="cpu", help="embedding 计算设备 (cpu/cuda/mps)")
@@ -281,6 +426,16 @@ def main() -> None:
         "--embeddings_only",
         action="store_true",
         help="只计算并缓存 embedding，不聚类",
+    )
+    parser.add_argument(
+        "--export_wavs",
+        action="store_true",
+        help="聚类后导出 wav + metadata.csv（默认只生成 segments.jsonl 引用）",
+    )
+    parser.add_argument(
+        "--person",
+        default=None,
+        help="搭配 --export_wavs 使用：只导出指定 person 的 wav（如 person_000）",
     )
     args = parser.parse_args()
 
@@ -295,6 +450,19 @@ def main() -> None:
         raise RuntimeError("manifest.jsonl 为空")
 
     print(f"📊 Loaded {len(manifest)} utterances from manifest")
+
+    # ── 如果只是要导出某个 person 的 wav（不需要重新聚类）───────────
+    if args.export_wavs and args.person:
+        person_dir = os.path.join(args.out_dir, args.person)
+        if not os.path.isdir(person_dir):
+            raise RuntimeError(f"找不到 {person_dir}；请先运行聚类")
+        export_person_wavs(
+            person_dir,
+            dataset_sr=args.dataset_sr,
+            min_dur=args.min_dur,
+            max_dur=args.max_dur,
+        )
+        return
 
     # ── Step 1: Compute / load cached embeddings ──────────────────────────
     emb_cache = os.path.join(args.emb_dir, "embeddings.npz")
@@ -360,20 +528,32 @@ def main() -> None:
             )
     print(f"📝 Saved detailed clusters → {detail_path}")
 
-    # ── Step 3: Build per-person training directories ─────────────────────
-    print("📂 Building per-person training directories...")
-    build_per_person_dirs(
-        utt2person,
-        manifest,
-        args.out_dir,
-        dataset_sr=args.dataset_sr,
-        min_dur=args.min_dur,
-        max_dur=args.max_dur,
-    )
+    # ── Step 3: Build per-person segments.jsonl（仅元数据，不切 wav）────
+    print("📂 Building per-person reference dirs...")
+    build_per_person_refs(utt2person, manifest, args.out_dir)
 
-    print("✅ Done:", args.out_dir)
+    # ── Step 4 (可选): 导出 wav ──────────────────────────────────────────
+    if args.export_wavs:
+        print("\n📂 Exporting wav files...")
+        for person in sorted(set(utt2person.values())):
+            if args.person and person != args.person:
+                continue
+            person_dir = os.path.join(args.out_dir, person)
+            export_person_wavs(
+                person_dir,
+                dataset_sr=args.dataset_sr,
+                min_dur=args.min_dur,
+                max_dur=args.max_dur,
+            )
+
+    print("\n✅ Done:", args.out_dir)
+    if not args.export_wavs:
+        print("   （未导出 wav 文件。训练前用 --export_wavs --person person_XXX 导出）")
     print()
-    print("下一步：选择某个 person 目录，用 train_xtts.py 开始训练：")
+    print("下一步：")
+    print(f"  # 导出某人的 wav（按需）")
+    print(f"  python3 cluster_speakers.py --emb_dir {args.emb_dir} --out_dir {args.out_dir} --export_wavs --person person_000")
+    print(f"  # 或直接用 train_xtts.py（会自动切 wav）")
     print(f"  python3 train_xtts.py --dataset_dir {args.out_dir}/person_000 --out_dir xtts_run --print_only")
 
 
