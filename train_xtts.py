@@ -48,6 +48,21 @@ def main() -> None:
         help="Coqui TTS 模型名（用于推理/基座参考；训练实际参数以本机 TTS 版本为准）",
     )
     parser.add_argument(
+        "--config_path",
+        default=None,
+        help="（可选）传给 TTS 的训练 config.json 路径；提供后可用 --run 启动训练",
+    )
+    parser.add_argument(
+        "--restore_path",
+        default=None,
+        help="（可选）传给 TTS 的 restore checkpoint 路径；提供后可用 --run 启动训练",
+    )
+    parser.add_argument(
+        "--run",
+        action="store_true",
+        help="尝试直接调用 python -m TTS.bin.train_tts 启动训练（需提供 --config_path/--restore_path）",
+    )
+    parser.add_argument(
         "--print_only",
         action="store_true",
         help="只生成拆分文件和命令模板，不尝试运行训练",
@@ -74,7 +89,7 @@ def main() -> None:
     write_lines(train_meta, train_lines)
     write_lines(eval_meta, eval_lines)
 
-    # 生成一个训练命令模板（不同 TTS 版本参数可能不同，所以不强行替你跑）
+    # 生成一个训练命令模板
     cmd_path = os.path.join(args.out_dir, "train_command.sh")
     tmpl = f"""#!/usr/bin/env bash
 set -euo pipefail
@@ -88,15 +103,14 @@ set -euo pipefail
 # - train meta: {os.path.abspath(train_meta)}
 # - eval meta: {os.path.abspath(eval_meta)}
 #
-# 如果你使用的是官方训练入口，通常类似：
-# python -m TTS.bin.train_tts \
-#   --config_path <xtts_config.json> \
-#   --output_path {os.path.abspath(args.out_dir)}/runs \
-#   --restore_path <base_checkpoint.pth>
+# 常见训练入口：
+# python -m TTS.bin.train_tts --help
 #
-# 由于 checkpoint/config 的获取方式取决于你安装的 TTS 版本与模型包，
-# 这里不做猜测。建议你把目标：XTTS v2 finetune，告诉我你安装的 TTS 版本输出，
-# 我可以把这条命令补到“可直接跑”。
+# 如果你已经有 config 与 checkpoint（restore），可以直接跑：
+# python -m TTS.bin.train_tts \
+#   --config_path <config.json> \
+#   --restore_path <checkpoint.pth> \
+#   --output_path {os.path.abspath(args.out_dir)}/runs
 
 python -m TTS.bin.train_tts --help
 """
@@ -111,6 +125,27 @@ python -m TTS.bin.train_tts --help
     print("-", cmd_path)
 
     if args.print_only:
+        return
+
+    if args.run:
+        if not args.config_path or not args.restore_path:
+            raise RuntimeError("使用 --run 需要同时提供 --config_path 与 --restore_path")
+
+        out_runs = os.path.join(args.out_dir, "runs")
+        os.makedirs(out_runs, exist_ok=True)
+        cmd = [
+            "python",
+            "-m",
+            "TTS.bin.train_tts",
+            "--config_path",
+            os.path.abspath(args.config_path),
+            "--restore_path",
+            os.path.abspath(args.restore_path),
+            "--output_path",
+            os.path.abspath(out_runs),
+        ]
+        print("▶ Running:", " ".join(cmd))
+        subprocess.run(cmd, check=True)
         return
 
     # 尝试只打印 TTS 版本信息（不执行训练）

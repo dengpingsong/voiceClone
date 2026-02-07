@@ -67,3 +67,14 @@ python3 diarize_segments.py --segments_json out/segments/xxx.json --out_json out
 ```bash
 python3 train_xtts.py --dataset_dir dataset --out_dir xtts_run --print_only
 ```
+
+如果你已经准备好了 Coqui TTS 训练用的 `config.json` 和 `restore` checkpoint，可以：
+
+```bash
+python3 train_xtts.py \
+  --dataset_dir dataset \
+  --out_dir xtts_run \
+  --config_path /path/to/config.json \
+  --restore_path /path/to/base_checkpoint.pth \
+  --run
+```
