@@ -58,6 +58,99 @@ def load_manifest(path: str) -> List[Dict]:
     return rows
 
 
+import re
+from collections import Counter
+
+# Whisper 幻觉 / 注解 / 噪声的过滤正则
+_PURE_ANNOT_RE = re.compile(
+    r"^[\(\（\[【][^\)\）\]】]*[\)\）\]】][。\.\s]*$"
+)  # (笑)。 [音楽] (小声) (音楽) etc.
+
+_MUSIC_NOISE_RE = re.compile(
+    r"^[♪♫🎵🎶\s\.\,。、！？!?\…~～\-]+$"
+)  # ♪~ 等纯音乐/符号
+
+_STARTS_WITH_ANNOT_RE = re.compile(
+    r"^[\(\（\[【][^\)\）\]】]*[\)\）\]】]\s*"
+)  # 以注解开头，如 "(スタッフ) xxx"
+
+
+def filter_manifest(
+    rows: List[Dict],
+    *,
+    halluc_threshold: int = 5,
+    min_text_len: int = 3,
+    min_dur: float = 1.0,
+    max_dur: float = 30.0,
+    verbose: bool = True,
+) -> List[Dict]:
+    """过滤 Whisper 幻觉、注解标记、噪声片段。
+
+    过滤规则（按优先级）：
+    1. **幻觉重复**: 完全相同的文本出现 >= halluc_threshold 次
+    2. **纯注解**: 整段文本都在括号内 (笑) [音楽] (小声) 等
+    3. **注解开头+短内容**: "(スタッフ)はい" 这种，去掉注解后文本 < min_text_len
+    4. **纯音乐/符号**: ♪~ 等
+    5. **过短文本**: 去掉注解后 < min_text_len 字符
+    6. **时长异常**: < min_dur 或 > max_dur 秒
+    """
+    # 统计文本频率
+    text_counts = Counter(r["text"].strip() for r in rows)
+    halluc_texts = {txt for txt, cnt in text_counts.items() if cnt >= halluc_threshold}
+
+    filtered: List[Dict] = []
+    reasons: Counter = Counter()
+
+    for r in rows:
+        txt = r["text"].strip()
+        dur = float(r.get("duration", float(r["end"]) - float(r["start"])))
+
+        # 1) 幻觉重复
+        if txt in halluc_texts:
+            reasons["hallucination"] += 1
+            continue
+
+        # 2) 纯注解 (笑) [音楽] (小声) (音楽)
+        if _PURE_ANNOT_RE.match(txt):
+            reasons["pure_annotation"] += 1
+            continue
+
+        # 3) 纯音乐/符号
+        if _MUSIC_NOISE_RE.match(txt):
+            reasons["music_noise"] += 1
+            continue
+
+        # 4) 以注解开头 → 去掉注解后检查剩余内容长度
+        clean_txt = _STARTS_WITH_ANNOT_RE.sub("", txt).strip()
+        if not clean_txt:
+            clean_txt = txt  # 如果全被替换了，用原文
+
+        # 5) 过短文本
+        if len(clean_txt) < min_text_len:
+            reasons["short_text"] += 1
+            continue
+
+        # 6) 时长异常
+        if dur < min_dur:
+            reasons["too_short_dur"] += 1
+            continue
+        if dur > max_dur:
+            reasons["too_long_dur"] += 1
+            continue
+
+        filtered.append(r)
+
+    if verbose:
+        print(f"🧹 Data filtering:")
+        for reason, cnt in reasons.most_common():
+            print(f"   {reason}: -{cnt}")
+        print(f"   ─────────────────")
+        print(f"   Before: {len(rows)}  →  After: {len(filtered)}  "
+              f"({len(filtered)/max(len(rows),1)*100:.1f}% kept)")
+
+    return filtered
+
+
 # ---------------------------------------------------------------------------
 # 2) Embedding（ECAPA-TDNN via speechbrain）— 从原始视频按需提取
 # ---------------------------------------------------------------------------
@@ -451,6 +544,11 @@ def main() -> None:
         default=None,
         help="搭配 --export_wavs 使用：只导出指定 person 的 wav（如 person_000）",
     )
+    parser.add_argument(
+        "--no_filter",
+        action="store_true",
+        help="跳过数据过滤（默认会过滤 Whisper 幻觉/注解/噪声）",
+    )
     args = parser.parse_args()
 
     ensure_ffmpeg()
@@ -464,6 +562,12 @@ def main() -> None:
         raise RuntimeError("manifest.jsonl 为空")
 
     print(f"📊 Loaded {len(manifest)} utterances from manifest")
+
+    # ── 数据过滤（去除 Whisper 幻觉/注解/噪声）──────────────────
+    if not args.no_filter:
+        manifest = filter_manifest(manifest)
+        if not manifest:
+            raise RuntimeError("过滤后没有剩余有效数据！请检查 Whisper 转录质量")
 
     # ── 如果只是要导出某个 person 的 wav（不需要重新聚类）───────────
     if args.export_wavs and args.person:
