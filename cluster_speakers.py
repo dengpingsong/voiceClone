@@ -2,9 +2,9 @@
 
 推荐方案：
 - Embedding: speechbrain ECAPA-TDNN (192-dim, 在 VoxCeleb 上训练, 效果好且轻量)
-- 聚类: Agglomerative Clustering + cosine distance
+- 聚类: Spherical KMeans（L2-normalized KMeans ≈ cosine KMeans）
   - 可手动指定人数 (--n_speakers)
-  - 也可自动检测 (silhouette score)
+  - 也可自动检测 (Kneedle 拐点法，基于 inertia 曲线)
 
 **存储优化**：整个流程不保存中间 wav 文件。
 - Embedding 直接从原始视频按需提取音频计算（按视频分组，每个视频只 ffmpeg 一次）。
@@ -207,16 +207,18 @@ def cluster_embeddings(
     min_speakers: int = 2,
     max_speakers: int = 10,
 ) -> Dict[str, str]:
-    """Spectral Clustering on cosine-similarity affinity matrix.
+    """Spherical KMeans（L2 归一化后的 KMeans ≈ cosine KMeans）。
 
-    对句子级 embedding 先做 L2 归一化，构建 cosine similarity 亲和矩阵，
-    然后用 Spectral Clustering（比 Agglomerative 更擅长处理高维、
-    方差大、簇大小不均匀的场景）。
+    自动 k 选择策略：**Inertia Elbow（Kneedle 拐点法）**。
+    - 在归一化的 inertia（簇内平方和）曲线上找"拐点"——
+      曲线离首尾连线最远的点，即边际收益开始递减的转折。
+    - 比 CH/DB/Silhouette 更适合 speaker embedding 这类
+      簇间距离不大、方差高的场景。
 
-    n_speakers=None 时自动用多指标（calinski-harabasz + davies-bouldin）选最优 k。
+    n_speakers=None 时自动搜索 [min_speakers, max_speakers] 中最优 k。
     返回 {utt_id: "person_000", ...}。
     """
-    from sklearn.cluster import SpectralClustering, KMeans
+    from sklearn.cluster import KMeans, MiniBatchKMeans
     from sklearn.metrics import calinski_harabasz_score, davies_bouldin_score
     from sklearn.preprocessing import normalize
 
@@ -227,24 +229,24 @@ def cluster_embeddings(
         return {utt_ids[0]: "person_000"}
 
     X = np.array([embeddings[uid] for uid in utt_ids])
-    X = normalize(X)  # L2 normalize
+    X = normalize(X)  # L2 normalize → KMeans on unit sphere ≈ cosine KMeans
 
-    # 构建 cosine similarity 亲和矩阵（clip 到 [0, 1]）
-    affinity = np.clip(X @ X.T, 0, 1)
+    # 大数据用 MiniBatchKMeans 加速，小数据用标准 KMeans
+    _KM = MiniBatchKMeans if len(utt_ids) > 5000 else KMeans
 
-    def _spectral(n_k: int) -> np.ndarray:
-        sc = SpectralClustering(
+    def _run_kmeans(n_k: int):
+        km = _KM(
             n_clusters=n_k,
-            affinity="precomputed",
-            assign_labels="kmeans",
             random_state=42,
             n_init=10,
+            max_iter=300,
         )
-        return sc.fit_predict(affinity)
+        labels = km.fit_predict(X)
+        return labels, km.inertia_
 
     if n_speakers is not None:
         n_k = min(n_speakers, len(utt_ids))
-        labels = _spectral(n_k)
+        labels, _ = _run_kmeans(n_k)
         counts = sorted(np.bincount(labels).tolist(), reverse=True)
         print(f"Clustering into {n_k} speakers (user-specified), sizes={counts}")
     else:
@@ -252,32 +254,43 @@ def cluster_embeddings(
         if max_k < min_speakers:
             return {uid: "person_000" for uid in utt_ids}
 
-        best_k = min_speakers
-        best_combined = -1e9
         results: Dict[int, np.ndarray] = {}
+        all_inertia: List[float] = []
+        ks = list(range(min_speakers, max_k + 1))
 
         print(f"🔍 Searching best k in [{min_speakers}, {max_k}]...")
-        for k in range(min_speakers, max_k + 1):
-            lbl = _spectral(k)
+        for k in ks:
+            lbl, inertia = _run_kmeans(k)
             results[k] = lbl
+            all_inertia.append(inertia)
 
             if len(set(lbl)) < 2:
-                continue
-
-            # CH 越大越好，DB 越小越好 → 用 CH - DB*1000 作为综合指标
-            ch = calinski_harabasz_score(X, lbl)
-            db = davies_bouldin_score(X, lbl)
-            combined = ch - db * 1000
+                ch, db = 0.0, 999.0
+            else:
+                ch = calinski_harabasz_score(X, lbl)
+                db = davies_bouldin_score(X, lbl)
             counts = sorted(np.bincount(lbl).tolist(), reverse=True)
-            print(f"   k={k:2d}  CH={ch:.1f}  DB={db:.3f}  combined={combined:.1f}  sizes={counts}")
+            print(f"   k={k:2d}  inertia={inertia:10.1f}  CH={ch:10.1f}  DB={db:.3f}  sizes={counts}")
 
-            if combined > best_combined:
-                best_combined = combined
-                best_k = k
+        # ── 自动选 k：Kneedle 拐点法 ──────────────────────────
+        # 把 inertia 曲线归一化到 [0,1]×[0,1]，
+        # 找曲线离首尾连线（对角线）最远的点 = "拐点"。
+        # 对递减凸曲线（inertia vs k），拐点在 argmin(D)。
+        ks_a = np.array(ks, dtype=float)
+        inertias_a = np.array(all_inertia, dtype=float)
+
+        if len(ks) > 2 and inertias_a[0] > inertias_a[-1]:
+            k_norm = (ks_a - ks_a[0]) / (ks_a[-1] - ks_a[0])
+            i_norm = (inertias_a - inertias_a[-1]) / (inertias_a[0] - inertias_a[-1])
+            # D = i_norm - (1 - k_norm)；递减凸曲线下 D < 0，拐点 = argmin(D)
+            D = i_norm - (1.0 - k_norm)
+            best_k = ks[int(np.argmin(D))]
+        else:
+            best_k = min_speakers
 
         labels = results[best_k]
         counts = sorted(np.bincount(labels).tolist(), reverse=True)
-        print(f"🔍 Auto-detected {best_k} speakers, sizes={counts}")
+        print(f"🔍 Auto-detected {best_k} speakers (inertia elbow), sizes={counts}")
 
     utt2person: Dict[str, str] = {}
     for uid, lbl in zip(utt_ids, labels):
@@ -417,6 +430,7 @@ def main() -> None:
         default=None,
         help="说话人数量；留空则自动检测",
     )
+    parser.add_argument("--min_speakers", type=int, default=2, help="自动检测时尝试的最小人数")
     parser.add_argument("--max_speakers", type=int, default=10, help="自动检测时尝试的最大人数")
     parser.add_argument("--dataset_sr", type=int, default=22050, help="导出 wav 采样率（XTTS 推荐 22050/24000）")
     parser.add_argument("--min_dur", type=float, default=1.0, help="最短句子（秒）")
@@ -494,6 +508,7 @@ def main() -> None:
     utt2person = cluster_embeddings(
         embeddings,
         n_speakers=args.n_speakers,
+        min_speakers=args.min_speakers,
         max_speakers=args.max_speakers,
     )
 
