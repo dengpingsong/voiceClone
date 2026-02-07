@@ -67,6 +67,38 @@ def list_videos(input_path: str, *, exts: Optional[Set[str]] = None) -> List[str
     return sorted(list(dict.fromkeys(videos)))
 
 
+def infer_input_root(input_arg: str, videos: List[str]) -> str:
+    """Infer a stable root path for computing video_rel.
+
+    Rules
+    - If input_arg is a directory: that directory.
+    - If input_arg is a file: its parent directory.
+    - If input_arg is a glob: common path of matched videos.
+    """
+    if os.path.isdir(input_arg):
+        return os.path.abspath(input_arg)
+
+    if os.path.isfile(input_arg):
+        return os.path.abspath(os.path.dirname(input_arg))
+
+    # glob or non-existing path: fall back to common path
+    abs_videos = [os.path.abspath(v) for v in videos]
+    if abs_videos:
+        try:
+            return os.path.commonpath(abs_videos)
+        except ValueError:
+            pass
+
+    return os.path.abspath(os.getcwd())
+
+
+def relpath_if_possible(path: str, root: str) -> Optional[str]:
+    try:
+        return os.path.relpath(os.path.abspath(path), os.path.abspath(root))
+    except Exception:
+        return None
+
+
 def safe_stem(path: str) -> str:
     stem = os.path.splitext(os.path.basename(path))[0]
     stem = re.sub(r"[^0-9A-Za-z._-]+", "_", stem).strip("_")

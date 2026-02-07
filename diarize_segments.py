@@ -102,7 +102,7 @@ def main() -> None:
     ensure_ffmpeg()
 
     data = load_json(args.segments_json)
-    video = data.get("video")
+    video = data.get("video_abs") or data.get("video")
     if not video:
         raise RuntimeError("segments_json 缺少 video 字段")
 

@@ -7,7 +7,7 @@ from typing import Dict, List, Tuple
 import soundfile as sf
 from tqdm import tqdm
 
-from vc_utils import ensure_ffmpeg, extract_audio, list_videos, safe_stem
+from vc_utils import ensure_ffmpeg, extract_audio, safe_stem
 
 
 def load_segments_json(path: str) -> Dict:
@@ -22,7 +22,7 @@ def iter_segments_from_dir(segments_dir: str) -> List[Tuple[str, Dict]]:
             continue
         path = os.path.join(segments_dir, fn)
         data = load_segments_json(path)
-        video = data.get("video")
+        video = data.get("video_abs") or data.get("video")
         if not video:
             continue
         items.append((video, data))
@@ -37,6 +37,7 @@ def build_dataset_for_video(
     min_duration: float,
     max_duration: float,
     video_path: str,
+    video_rel: str | None,
     global_index_start: int,
 ) -> Tuple[List[Dict], int]:
     os.makedirs(out_wavs_dir, exist_ok=True)
@@ -46,6 +47,7 @@ def build_dataset_for_video(
     idx = global_index_start
 
     for seg in segments:
+        utt_id = seg.get("utt_id")
         start_t = float(seg["start"])
         end_t = float(seg["end"])
         duration = end_t - start_t
@@ -58,18 +60,20 @@ def build_dataset_for_video(
             continue
 
         clip = audio[start:end]
-        name = f"{idx:07d}.wav"
+        name = f"{utt_id}.wav" if utt_id else f"{idx:07d}.wav"
         out_path = os.path.join(out_wavs_dir, name)
 
         sf.write(out_path, clip, sr)
         accepted.append(
             {
                 "id": idx,
+                "utt_id": utt_id,
                 "name": name,
                 "start": start_t,
                 "end": end_t,
                 "text": str(seg.get("text", "")).strip(),
                 "video": video_path,
+                "video_rel": video_rel,
                 "sr": int(sr),
             }
         )
@@ -132,6 +136,7 @@ def main() -> None:
             min_duration=args.min_dur,
             max_duration=args.max_dur,
             video_path=video,
+            video_rel=data.get("video_rel"),
             global_index_start=global_idx,
         )
 
