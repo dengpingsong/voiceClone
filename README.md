@@ -70,12 +70,41 @@ pip install pyannote.audio
   - `out/segments/<video>.json`：含 `input_root`、`video_abs`、`video_rel`、每句 `utt_id`
   - `out/srts/<video>.srt`
 
+### 语言自动识别（auto）
+
+当不传 `--language` 时，faster-whisper 会自动检测语言。
+脚本会把检测结果写入每个 `out/segments/<video>.json`：
+- `language`：最终使用的语言（auto 时为检测结果；手动指定时为指定值）
+- `language_requested`：命令行传入的语言（未指定则为 `null`）
+- `language_detected` / `language_probability`：模型检测出的语言与置信度（若后端支持）
+
+这能解决“auto 检测了语言但没落盘，后续脚本不知道语言”的问题。
+
+### 只保留人类语言相关片段（更稳）
+
+- 默认开启 faster-whisper 的 `vad_filter`（用 `--no_vad` 才关闭），可以显著减少静音/非语音段。
+- 可选 `--speech_enhance`：在转写前用 ffmpeg 做轻量人声增强（带通 + 降噪），对背景音乐/环境噪声场景更友好。
+  - 注意：这不是严格意义的“人声分离 / separate_vocals”（Demucs/UVR 那类），但速度快、无需额外依赖。
+
 ```bash
 # faster-whisper（默认）
 python3 whisperVideo.py transcribe \
   --input /Users/apple/Desktop/videos \
   --out_dir out \
-  --language ja
+  --device mps
+
+# 如果你希望 auto 检测语言并写入 segments JSON：不要传 --language
+python3 whisperVideo.py transcribe \
+  --input /Users/apple/Desktop/videos \
+  --out_dir out \
+  --device mps
+
+# 背景音乐/噪声比较重时：建议加上轻量增强
+python3 whisperVideo.py transcribe \
+  --input /Users/apple/Desktop/videos \
+  --out_dir out \
+  --device mps \
+  --speech_enhance
 
 # 或用 whisper-cli
 python3 whisperVideo.py transcribe \
@@ -252,7 +281,21 @@ python3 diarize_segments.py \
 ```bash
 # ① 转写（每视频一个 JSON + SRT）
 python3 whisperVideo.py transcribe --input /Users/apple/Desktop/videos --out_dir out --language ja --backend whisper-cli --whisper_cli_model /Users/apple/models/ggml-base.bin
+# whisper-cli + 人声增强（推荐，原生 MPS 加速）
+python3 whisperVideo.py transcribe \
+  --input /Users/apple/Download/photo \
+  --out_dir out \
+  --backend whisper-cli \
+  --whisper_cli_model ~/models/ggml-base.bin \
+  --speech_enhance
 
+# 指定语言（跳过自动检测，更快更准）
+python3 whisperVideo.py transcribe \
+  --input /Users/apple/Download/photo \
+  --out_dir out \
+  --backend whisper-cli \
+  --whisper_cli_model ~/models/ggml-base.bin \
+  --language ja
 # ② 导出 manifest（仅元数据，不保存 wav）
 python3 export_embedding_dataset.py --segments_dir out/segments --out_dir emb_dataset
 
