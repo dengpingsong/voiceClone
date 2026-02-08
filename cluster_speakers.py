@@ -27,6 +27,7 @@
 
 import argparse
 import csv
+import gc
 import json
 import os
 import warnings
@@ -42,6 +43,36 @@ from tqdm import tqdm
 warnings.filterwarnings("ignore", message=".*An output with one or more elements was resized.*")
 
 from vc_utils import ensure_ffmpeg, extract_audio
+
+
+def _clear_torch_cache(device: str) -> None:
+    """尽量把 PyTorch 的缓存显存/内存归还给系统，防止长循环爆内存。
+
+    说明：PyTorch 本身有 caching allocator，内存不一定立刻归还给 OS。
+    这里做的是“尽最大可能”清理，尤其对 CUDA/MPS 长时间推理很有用。
+    """
+    # 先做一次 Python 层垃圾回收，尽快释放张量引用
+    gc.collect()
+
+    dev = (device or "").lower()
+
+    # CUDA
+    if dev.startswith("cuda") and torch.cuda.is_available():
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+        try:
+            torch.cuda.ipc_collect()
+        except Exception:
+            pass
+
+    # Apple Silicon (MPS)
+    if dev == "mps" and hasattr(torch, "mps"):
+        try:
+            torch.mps.empty_cache()  # type: ignore[attr-defined]
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -248,22 +279,33 @@ def compute_embeddings(
             except OSError:
                 pass
 
+        # 避免后续反复 dtype 转换（soundfile 默认 float64）
+        if isinstance(audio, np.ndarray) and audio.dtype != np.float32:
+            audio = audio.astype(np.float32, copy=False)
+
         # 收集本视频所有有效片段
-        clips: List[tuple] = []  # (utt_id, signal_tensor)
+        # 注意：不要在这里把每个 clip 都做成 torch.Tensor 并长期持有，
+        # 否则一个视频里片段很多时会在 CPU/GPU/MPS 上堆积，导致峰值内存暴涨。
+        clips: List[tuple] = []  # (utt_id, start_i, end_i)
         for row in rows:
             utt_id = row["utt_id"]
             start_i = int(float(row["start"]) * sr)
             end_i = int(float(row["end"]) * sr)
             if end_i <= start_i:
                 continue
-            clip = audio[start_i:end_i]
-            clips.append((utt_id, torch.tensor(clip, dtype=torch.float32)))
+            clips.append((utt_id, start_i, end_i))
 
         # 分批送入模型（batch 推理远快于逐条）
         for i in range(0, len(clips), batch_size):
             batch = clips[i : i + batch_size]
             uids = [c[0] for c in batch]
-            signals = [c[1] for c in batch]
+            # 延迟构造张量，降低一个视频内的峰值占用
+            signals: List[torch.Tensor] = []
+            for _, s_i, e_i in batch:
+                clip = audio[s_i:e_i]
+                # 尽量保持 contiguous，避免某些情况下额外拷贝
+                clip = np.ascontiguousarray(clip)
+                signals.append(torch.from_numpy(clip))
 
             # 对齐到同一长度（pad 到 batch 内最长）
             max_len = max(s.shape[0] for s in signals)
@@ -273,18 +315,38 @@ def compute_embeddings(
                 padded[j, : s.shape[0]] = s
                 lengths[j] = s.shape[0] / max_len
 
+            embs = None
             try:
-                embs = classifier.encode_batch(padded, lengths)  # (B, 1, 192)
-                for j, uid in enumerate(uids):
-                    embeddings[uid] = embs[j].squeeze().cpu().numpy()
-            except Exception as e:
+                with torch.inference_mode():
+                    embs = classifier.encode_batch(padded, lengths)  # (B, 1, 192)
+                    for j, uid in enumerate(uids):
+                        embeddings[uid] = embs[j].squeeze().cpu().numpy()
+            except Exception:
                 # 批量失败时回退到逐条
                 for j, uid in enumerate(uids):
                     try:
-                        emb = classifier.encode_batch(signals[j].unsqueeze(0))
+                        with torch.inference_mode():
+                            emb = classifier.encode_batch(signals[j].unsqueeze(0))
                         embeddings[uid] = emb.squeeze().cpu().numpy()
                     except Exception as e2:
                         print(f"⚠️  {uid}: embedding 失败 ({e2})")
+            finally:
+                # 及时释放本 batch 的中间张量，避免长循环内存持续上涨
+                try:
+                    del padded, lengths
+                except Exception:
+                    pass
+                if embs is not None:
+                    try:
+                        del embs
+                    except Exception:
+                        pass
+                del signals
+
+        # 处理完一个视频后，释放大对象 + 清空缓存
+        del clips
+        del audio
+        _clear_torch_cache(device)
 
     return embeddings
 
@@ -347,14 +409,12 @@ def cluster_embeddings(
         if max_k < min_speakers:
             return {uid: "person_000" for uid in utt_ids}
 
-        results: Dict[int, np.ndarray] = {}
         all_inertia: List[float] = []
         ks = list(range(min_speakers, max_k + 1))
 
         print(f"🔍 Searching best k in [{min_speakers}, {max_k}]...")
         for k in ks:
             lbl, inertia = _run_kmeans(k)
-            results[k] = lbl
             all_inertia.append(inertia)
 
             if len(set(lbl)) < 2:
@@ -381,7 +441,7 @@ def cluster_embeddings(
         else:
             best_k = min_speakers
 
-        labels = results[best_k]
+        labels, _ = _run_kmeans(best_k)
         counts = sorted(np.bincount(labels).tolist(), reverse=True)
         print(f"🔍 Auto-detected {best_k} speakers (inertia elbow), sizes={counts}")
 
@@ -477,6 +537,9 @@ def export_person_wavs(
             except OSError:
                 pass
 
+        if isinstance(audio, np.ndarray) and audio.dtype != np.float32:
+            audio = audio.astype(np.float32, copy=False)
+
         for r in utts:
             dur = float(r["duration"])
             if dur < min_dur or dur > max_dur:
@@ -492,6 +555,10 @@ def export_person_wavs(
             wav_name = f"{utt_id}.wav"
             sf.write(os.path.join(wavs_dir, wav_name), clip, sr)
             metadata_rows.append([wav_name, str(r.get("text", "")).strip()])
+
+        # 处理完一个视频及时释放，避免导出大量视频时内存涨上去
+        del audio
+        gc.collect()
 
     # 写 metadata.csv（LJSpeech / XTTS 兼容格式：name|text）
     meta_path = os.path.join(person_dir, "metadata.csv")
@@ -616,6 +683,10 @@ def main() -> None:
         max_speakers=args.max_speakers,
     )
 
+    # embeddings 占用可能很大（尤其 utterance 很多时），聚类后尽早释放
+    del embeddings
+    _clear_torch_cache(args.device)
+
     os.makedirs(args.out_dir, exist_ok=True)
 
     # 保存映射表
@@ -647,6 +718,10 @@ def main() -> None:
             )
     print(f"📝 Saved detailed clusters → {detail_path}")
 
+    # 释放 lookup 表，避免后续导出 wav 时内存继续抬高
+    del utt_lookup
+    _clear_torch_cache(args.device)
+
     # ── Step 3: Build per-person segments.jsonl（仅元数据，不切 wav）────
     print("📂 Building per-person reference dirs...")
     build_per_person_refs(utt2person, manifest, args.out_dir)
@@ -664,6 +739,8 @@ def main() -> None:
                 min_dur=args.min_dur,
                 max_dur=args.max_dur,
             )
+
+        _clear_torch_cache(args.device)
 
     print("\n✅ Done:", args.out_dir)
     if not args.export_wavs:

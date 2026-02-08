@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import uuid
 from typing import Any, Dict, List, Optional
@@ -50,22 +51,58 @@ def _guess_compute_type(device: str) -> str:
     return "int8"
 
 
+def _maybe_enhance_speech_audio(in_wav: str, out_wav: str) -> None:
+    """用 ffmpeg 做轻量的人声增强（不是严格的 source separation）。
+
+    目标：降低低频轰鸣 + 高频刺耳，做一点点降噪，让 ASR 更稳。
+    """
+    # afftdn: ffmpeg 自带频域降噪；highpass/lowpass 做简单带通
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        in_wav,
+        "-af",
+        "highpass=f=80,lowpass=f=8000,afftdn",
+        out_wav,
+    ]
+    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    if not os.path.exists(out_wav) or os.path.getsize(out_wav) == 0:
+        raise RuntimeError("speech enhance failed (ffmpeg)")
+
+
+def _segment_to_dict(s: Any) -> Dict[str, Any]:
+    """把 faster-whisper segment 对象转成稳定 dict。"""
+    d: Dict[str, Any] = {
+        "start": float(getattr(s, "start")),
+        "end": float(getattr(s, "end")),
+        "text": (getattr(s, "text", "") or "").strip(),
+    }
+    # 这些字段在不同版本/配置下可能不存在，尽量带上，方便后续过滤“非人类语言/噪声段”
+    for k in ["avg_logprob", "no_speech_prob", "compression_ratio", "temperature"]:
+        v = getattr(s, k, None)
+        if v is not None:
+            try:
+                d[k] = float(v)
+            except Exception:
+                d[k] = v
+    return d
+
+
 def transcribe_faster_whisper(
     wav_path: str,
     *,
-    model_size: str,
-    device: str,
+    model: Any,
     language: Optional[str],
     translate: bool,
     vad_filter: bool,
-) -> List[Dict[str, Any]]:
+) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
     if WhisperModel is None:
         raise RuntimeError(
             "faster-whisper 未安装或导入失败；请安装 faster-whisper 或改用 --backend whisper-cli"
         )
 
-    model = WhisperModel(model_size, device=device, compute_type=_guess_compute_type(device))
-    segments, _info = model.transcribe(
+    segments, info = model.transcribe(
         wav_path,
         language=language if language else "auto",
         vad_filter=vad_filter,
@@ -74,8 +111,24 @@ def transcribe_faster_whisper(
 
     out: List[Dict[str, Any]] = []
     for s in segments:
-        out.append({"start": float(s.start), "end": float(s.end), "text": (s.text or "").strip()})
-    return out
+        d = _segment_to_dict(s)
+        if d.get("text"):
+            out.append(d)
+
+    info_dict: Dict[str, Any] = {}
+    if info is not None:
+        # faster-whisper TranscriptionInfo 通常包含 language / language_probability
+        lang = getattr(info, "language", None)
+        lang_prob = getattr(info, "language_probability", None)
+        if lang is not None:
+            info_dict["language_detected"] = str(lang)
+        if lang_prob is not None:
+            try:
+                info_dict["language_probability"] = float(lang_prob)
+            except Exception:
+                info_dict["language_probability"] = lang_prob
+
+    return out, info_dict
 
 
 def transcribe_whisper_cli(
@@ -188,6 +241,11 @@ def main() -> None:
     p.add_argument("--language", default=None, help="语言代码，如 ja/en/zh；留空=auto")
     p.add_argument("--translate", action="store_true", help="翻译到英文（类似 whisper-cli -tr）")
     p.add_argument("--no_vad", action="store_true", help="关闭 VAD 过滤")
+    p.add_argument(
+        "--speech_enhance",
+        action="store_true",
+        help="转写前用 ffmpeg 做轻量人声增强（带通+降噪），改善音乐/噪声背景下识别",
+    )
     p.add_argument("--keep_tmp", action="store_true", help="保留中间 wav")
     p.add_argument("--whisper_cli_model", default=None, help="whisper-cli ggml 模型路径")
 
@@ -208,24 +266,51 @@ def main() -> None:
     os.makedirs(seg_dir, exist_ok=True)
     os.makedirs(tmp_dir, exist_ok=True)
 
+    fw_model = None
+    if args.backend == "faster-whisper":
+        if WhisperModel is None:
+            raise RuntimeError("faster-whisper 未安装或导入失败；请先安装 faster-whisper")
+        # 复用同一个模型实例（避免每个视频重复加载导致慢/占用高）
+        fw_model = WhisperModel(
+            args.model_size,
+            device=args.device,
+            compute_type=_guess_compute_type(args.device),
+        )
+
     for video_path in tqdm(videos, desc="Videos"):
         tag = safe_stem(video_path)
         video_abs = os.path.abspath(video_path)
         video_rel = relpath_if_possible(video_abs, input_root)
 
+        transcribe_info: Dict[str, Any] = {}
+        language_used = args.language
+
         if args.backend == "faster-whisper":
             tmp_wav = os.path.join(tmp_dir, f"{tag}.whisper.wav")
             extract_audio(video_path, tmp_wav, sample_rate=args.whisper_sr, mono=True)
-            segs = transcribe_faster_whisper(
-                tmp_wav,
-                model_size=args.model_size,
-                device=args.device,
+
+            wav_for_asr = tmp_wav
+            enhanced_wav = None
+            if args.speech_enhance:
+                enhanced_wav = os.path.join(tmp_dir, f"{tag}.enhanced.wav")
+                _maybe_enhance_speech_audio(tmp_wav, enhanced_wav)
+                wav_for_asr = enhanced_wav
+
+            segs, transcribe_info = transcribe_faster_whisper(
+                wav_for_asr,
+                model=fw_model,
                 language=args.language,
                 translate=bool(args.translate),
                 vad_filter=not bool(args.no_vad),
             )
+
+            if args.language is None:
+                language_used = transcribe_info.get("language_detected")
+
             if not args.keep_tmp and os.path.exists(tmp_wav):
                 os.remove(tmp_wav)
+            if enhanced_wav and (not args.keep_tmp) and os.path.exists(enhanced_wav):
+                os.remove(enhanced_wav)
         else:
             if not args.whisper_cli_model:
                 raise RuntimeError("backend=whisper-cli 需要提供 --whisper_cli_model")
@@ -259,7 +344,12 @@ def main() -> None:
                 "video_rel": video_rel,
                 "backend": args.backend,
                 "whisper_sr": int(args.whisper_sr),
-                "language": args.language,
+                # language: 下游建议读取这个字段
+                # - 如果用户指定 --language，就等于指定值
+                # - 否则写入模型自动检测的语言（如果可用）
+                "language": language_used,
+                "language_requested": args.language,
+                **transcribe_info,
                 "translate": bool(args.translate),
                 "segments": enriched,
             },
