@@ -10,12 +10,49 @@ from typing import List, Optional, Set
 VIDEO_EXTS_DEFAULT: Set[str] = {".mp4", ".mov", ".mkv", ".webm", ".m4v", ".avi"}
 
 
-def run_cmd(cmd: List[str], *, quiet: bool = True) -> None:
-    stdout = subprocess.DEVNULL if quiet else None
-    stderr = subprocess.DEVNULL if quiet else None
-    p = subprocess.run(cmd, stdout=stdout, stderr=stderr)
-    if p.returncode != 0:
-        raise RuntimeError(f"Command failed ({p.returncode}): {' '.join(cmd)}")
+def run_cmd(cmd: List[str], *, quiet: bool = True, retries: int = 2) -> None:
+    """运行命令，支持重试和详细错误信息。"""
+    last_error = None
+    
+    for attempt in range(retries + 1):
+        try:
+            stdout = subprocess.DEVNULL if quiet else None
+            stderr = subprocess.PIPE
+            
+            p = subprocess.run(
+                cmd, 
+                stdout=stdout, 
+                stderr=stderr, 
+                text=True, 
+                encoding='utf-8',
+                errors='replace'
+            )
+            
+            if p.returncode == 0:
+                return  # 成功
+                
+            # 记录错误信息
+            stderr_output = p.stderr.strip() if p.stderr else "无错误信息"
+            error_msg = f"Command failed ({p.returncode}): {' '.join(cmd)}\n错误输出: {stderr_output}"
+            
+            if attempt < retries:
+                print(f"⚠️  尝试 {attempt + 1}/{retries + 1} 失败，将重试: {error_msg}")
+                last_error = error_msg
+                continue
+            else:
+                raise RuntimeError(error_msg)
+                
+        except subprocess.SubprocessError as e:
+            error_msg = f"Subprocess error: {e}"
+            if attempt < retries:
+                print(f"⚠️  尝试 {attempt + 1}/{retries + 1} 失败，将重试: {error_msg}")
+                last_error = error_msg
+                continue
+            else:
+                raise RuntimeError(error_msg)
+    
+    # 所有重试都失败了
+    raise RuntimeError(f"命令在 {retries + 1} 次尝试后仍然失败: {last_error}")
 
 
 def ensure_ffmpeg() -> None:
@@ -24,19 +61,34 @@ def ensure_ffmpeg() -> None:
 
 
 def extract_audio(video_path: str, wav_path: str, *, sample_rate: int, mono: bool = True) -> None:
+    """提取音频，支持包含空格和中文字符的路径。"""
+    # 确保输出目录存在
+    os.makedirs(os.path.dirname(wav_path), exist_ok=True)
+    
     cmd = [
         "ffmpeg",
         "-y",
         "-i",
-        video_path,
-        "-vn",
+        video_path,  # ffmpeg 可以直接处理包含空格的路径
+        "-vn",       # 不包含视频流
         "-ac",
         "1" if mono else "2",
         "-ar",
         str(sample_rate),
+        "-acodec", "pcm_s16le",  # 明确指定音频编码
         wav_path,
     ]
-    run_cmd(cmd, quiet=True)
+    
+    try:
+        run_cmd(cmd, quiet=True, retries=2)
+    except RuntimeError as e:
+        # 提供更有用的错误信息
+        raise RuntimeError(
+            f"音频提取失败:\n"
+            f"  输入视频: {video_path}\n"
+            f"  输出音频: {wav_path}\n"
+            f"  详细错误: {e}"
+        ) from e
 
 
 def list_videos(input_path: str, *, exts: Optional[Set[str]] = None) -> List[str]:

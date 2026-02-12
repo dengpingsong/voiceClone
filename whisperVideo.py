@@ -6,6 +6,7 @@ import re
 import subprocess
 import uuid
 import warnings
+import psutil
 from typing import Any, Dict, List, Optional, Tuple
 
 from tqdm import tqdm
@@ -14,6 +15,11 @@ try:
     from faster_whisper import WhisperModel
 except Exception:  # pragma: no cover
     WhisperModel = None
+
+try:
+    import mlx_whisper
+except Exception:  # pragma: no cover
+    mlx_whisper = None
 
 from vc_utils import (
     ensure_ffmpeg,
@@ -63,7 +69,10 @@ def _guess_compute_type(device: str) -> str:
 def _resolve_fw_device(device: str) -> str:
     """faster-whisper (ctranslate2) 不支持 MPS，自动降级 CPU。"""
     if device == "mps":
-        print("⚠️  faster-whisper (ctranslate2) 不支持 MPS，自动降级到 CPU")
+        print(
+            "⚠️  faster-whisper (ctranslate2) 当前不支持 Apple MPS；将自动降级到 CPU\n"
+            "   → 想用 Apple GPU 加速：建议改用 --backend whisper-cli（whisper.cpp + Metal）"
+        )
         return "cpu"
     return device
 
@@ -176,6 +185,89 @@ def transcribe_faster_whisper(
     return out, transcribe_info
 
 
+# ---------------------------------------------------------------------------
+# mlx-whisper 后端（Apple Silicon Metal GPU 加速）
+# ---------------------------------------------------------------------------
+
+# mlx-whisper 模型尺寸到 HuggingFace repo 的映射
+_MLX_MODEL_MAP: Dict[str, str] = {
+    "tiny":       "mlx-community/whisper-tiny-mlx",
+    "tiny.en":    "mlx-community/whisper-tiny.en-mlx",
+    "base":       "mlx-community/whisper-base-mlx",
+    "base.en":    "mlx-community/whisper-base.en-mlx",
+    "small":      "mlx-community/whisper-small-mlx",
+    "small.en":   "mlx-community/whisper-small.en-mlx",
+    "medium":     "mlx-community/whisper-medium-mlx",
+    "medium.en":  "mlx-community/whisper-medium.en-mlx",
+    "large":      "mlx-community/whisper-large-mlx",
+    "large-v2":   "mlx-community/whisper-large-v2-mlx",
+    "large-v3":   "mlx-community/whisper-large-v3-mlx",
+    "large-v3-turbo": "mlx-community/whisper-large-v3-turbo",
+}
+
+
+def _resolve_mlx_model(model_size: str) -> str:
+    """将 model_size 转换为 mlx-whisper 的 HuggingFace repo 路径。"""
+    if model_size in _MLX_MODEL_MAP:
+        return _MLX_MODEL_MAP[model_size]
+    # 如果用户直接传了完整 repo 路径，透传
+    if "/" in model_size:
+        return model_size
+    raise ValueError(
+        f"未知的 mlx-whisper 模型尺寸: {model_size}\n"
+        f"支持: {', '.join(_MLX_MODEL_MAP.keys())} 或直接传 HuggingFace repo 路径"
+    )
+
+
+def transcribe_mlx_whisper(
+    wav_path: str,
+    *,
+    model_size: str = "large-v3",
+    language: Optional[str] = None,
+    translate: bool = False,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """使用 mlx-whisper 转写（Apple Silicon Metal GPU 加速）。
+
+    Returns (segments, info).
+    mlx-whisper API 兼容 OpenAI whisper，返回 dict 格式。
+    """
+    if mlx_whisper is None:
+        raise RuntimeError(
+            "mlx-whisper 未安装；请 pip install mlx-whisper\n"
+            "注意：仅支持 Apple Silicon Mac（M1/M2/M3/M4）"
+        )
+
+    repo = _resolve_mlx_model(model_size)
+    tqdm.write(f"   🍎 mlx-whisper: using {repo}")
+
+    kw: Dict[str, Any] = {
+        "path_or_hf_repo": repo,
+        "task": "translate" if translate else "transcribe",
+        "verbose": False,
+    }
+    if language:
+        kw["language"] = language
+
+    result = mlx_whisper.transcribe(wav_path, **kw)
+
+    out: List[Dict[str, Any]] = []
+    for s in result.get("segments", []):
+        text = (s.get("text") or "").strip()
+        if text:
+            out.append({
+                "start": float(s["start"]),
+                "end":   float(s["end"]),
+                "text":  text,
+            })
+
+    detected_lang = result.get("language", language or "unknown")
+    transcribe_info = {
+        "language_detected": detected_lang,
+        "language_probability": 0.0,  # mlx-whisper 不返回概率
+    }
+    return out, transcribe_info
+
+
 def transcribe_whisper_cli(
     wav_path: str,
     *,
@@ -194,6 +286,15 @@ def transcribe_whisper_cli(
     cli_cmd += ["-l", language if language else "auto"]
     if translate:
         cli_cmd += ["-tr"]
+
+    # ── 抑制幻觉参数 ──────────────────────────────────
+    # 注意: --vad 需要单独的 Silero VAD 模型文件，这里不启用
+    cli_cmd += [
+        "-sns",                     # suppress non-speech tokens
+        "-et", "2.4",               # entropy threshold（高熵=乱猜→丢弃）
+        "-lpt", "-0.5",             # logprob threshold（低概率→丢弃）
+        "--no-speech-thold", "0.6", # 无语音阈值
+    ]
 
     result = subprocess.run(
         cli_cmd,
@@ -308,6 +409,117 @@ def transcribe_whisper_cli(
     return segments, transcribe_info
 
 
+def _is_internal_repetition(text: str, *, min_repeats: int = 8) -> bool:
+    """检测单个 segment 内部是否存在高度重复内容。
+
+    例如 "あ、あ、あ、あ、あ..." 或 "ああああああ..."
+    原理：尝试找最短重复单元，如果文本由该单元重复 >= min_repeats 次组成，则判定为幻觉。
+    """
+    text = text.strip()
+    if len(text) < min_repeats:
+        return False
+
+    # 尝试不同长度的重复单元（1~20 个字符）
+    for unit_len in range(1, min(21, len(text) // min_repeats + 1)):
+        unit = text[:unit_len]
+        # 计算该单元在文本中连续/间隔出现的次数
+        count = 0
+        pos = 0
+        while pos <= len(text) - unit_len:
+            if text[pos:pos + unit_len] == unit:
+                count += 1
+                pos += unit_len
+            else:
+                # 允许跳过 1~2 个分隔符（逗号、顿号、空格等）
+                skip = 0
+                while skip < 3 and pos + skip < len(text) and text[pos + skip] in "、,，. 　・":
+                    skip += 1
+                if skip > 0 and pos + skip + unit_len <= len(text) and text[pos + skip:pos + skip + unit_len] == unit:
+                    count += 1
+                    pos += skip + unit_len
+                else:
+                    break
+        if count >= min_repeats:
+            return True
+
+    return False
+
+
+def _filter_hallucinations(
+    segments: List[Dict[str, Any]],
+    *,
+    max_repeat: int = 3,
+    max_global_freq: int = 8,
+) -> List[Dict[str, Any]]:
+    """后处理：检测并过滤 whisper 幻觉。
+
+    三道过滤策略：
+    1. 连续相同文本 > max_repeat 次 → 合并为 1 个
+    2. 单 segment 内部高度重复（"あ、あ、あ..."）→ 移除
+    3. 全局频次：同一文本出现 > max_global_freq 次 → 只保留前 max_repeat 个
+
+    这不会伤害正常转写——真实对话中极少出现完全相同的句子连续 >3 次。
+    """
+    if not segments:
+        return segments
+
+    original_count = len(segments)
+
+    # ── Pass 1: 合并连续重复 ──────────────────────────────
+    pass1: List[Dict[str, Any]] = []
+    i = 0
+    while i < len(segments):
+        text = segments[i].get("text", "").strip()
+        if not text:
+            i += 1
+            continue
+
+        j = i + 1
+        while j < len(segments) and segments[j].get("text", "").strip() == text:
+            j += 1
+        run_len = j - i
+
+        if run_len <= max_repeat:
+            pass1.extend(segments[i:j])
+        else:
+            merged = dict(segments[i])
+            merged["end"] = segments[j - 1]["end"]
+            merged["text"] = text
+            pass1.append(merged)
+        i = j
+
+    # ── Pass 2: 移除内部高度重复的 segment ────────────────
+    pass2: List[Dict[str, Any]] = []
+    for seg in pass1:
+        text = seg.get("text", "").strip()
+        if _is_internal_repetition(text):
+            continue
+        pass2.append(seg)
+
+    # ── Pass 3: 全局频次限制 ──────────────────────────────
+    # 如果同一文本在整个音频中出现太多次（即使不连续），大概率是幻觉
+    from collections import Counter
+    freq: Counter = Counter(s.get("text", "").strip() for s in pass2)
+    seen_count: Dict[str, int] = {}
+    pass3: List[Dict[str, Any]] = []
+    for seg in pass2:
+        text = seg.get("text", "").strip()
+        if freq[text] > max_global_freq:
+            seen_count[text] = seen_count.get(text, 0) + 1
+            if seen_count[text] > max_repeat:
+                continue  # 超出限额，跳过
+        pass3.append(seg)
+
+    total_removed = original_count - len(pass3)
+    if total_removed > 0:
+        tqdm.write(
+            f"   🧹 Hallucination filter: removed {total_removed} "
+            f"segments ({original_count} → {len(pass3)})"
+        )
+
+    return pass3
+
+
 def _save_segments_json(out_path: str, payload: Dict[str, Any]) -> None:
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as f:
@@ -319,16 +531,55 @@ def _save_segments_json(out_path: str, payload: Dict[str, Any]) -> None:
 # ---------------------------------------------------------------------------
 
 _demucs_model = None
+_demucs_device = None
+
+
+def _memory_usage_mb():
+    """获取当前进程内存使用量（MB）。"""
+    try:
+        process = psutil.Process()
+        return process.memory_info().rss / 1024 / 1024  # MB
+    except Exception:
+        return 0
+
+
+def _cleanup_gpu_memory(device):
+    """强制清理 GPU 内存缓存。"""
+    try:
+        import torch
+        if torch.cuda.is_available() and "cuda" in device.lower():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available() and "mps" in device.lower():
+            torch.mps.empty_cache()
+            # 更积极的 MPS 清理
+            if hasattr(torch.mps, 'synchronize'):
+                torch.mps.synchronize()
+    except Exception as e:
+        print(f"   ⚠️  GPU 内存清理失败: {e}")
+    
+    # 强制垃圾回收 
+    gc.collect()
 
 
 def _load_demucs(device: str):
     """加载 demucs htdemucs 模型（全局缓存，只加载一次）。
 
     demucs 原生支持 CPU / CUDA / MPS。
+    增强了内存管理和设备检查。
     """
-    global _demucs_model
-    if _demucs_model is not None:
+    global _demucs_model, _demucs_device
+    
+    # 如果模型已加载且设备匹配，直接返回
+    if _demucs_model is not None and _demucs_device == device:
         return _demucs_model
+    
+    # 如果设备发生变化，先清理旧模型
+    if _demucs_model is not None and _demucs_device != device:
+        print(f"   🔄 设备变化 ({_demucs_device} -> {device})，重新加载模型...")
+        del _demucs_model
+        _cleanup_gpu_memory(_demucs_device)
+        _demucs_model = None
 
     try:
         import torch  # noqa: F811
@@ -340,18 +591,44 @@ def _load_demucs(device: str):
             "或者去掉 --speech_enhance 参数"
         )
 
-    print("🎵 Loading demucs model (htdemucs) for vocal separation...")
+    mem_before = _memory_usage_mb()
+    print(f"🎵 Loading demucs model (htdemucs) for vocal separation...")
+    print(f"   内存使用: {mem_before:.1f} MB")
+    
     model = get_model("htdemucs")
+    
+    # 设备检查和回退逻辑
+    target_device = device
     try:
-        model.to(device)
-        print(f"   ✅ demucs loaded on device={device}")
-    except Exception:
-        print(f"   ⚠️  demucs 无法使用 {device}，降级到 CPU")
-        device = "cpu"
-        model.to(device)
-        print(f"   ✅ demucs loaded on device={device}")
+        # MPS 内存限制检查
+        if "mps" in device.lower():
+            mem_current = _memory_usage_mb()
+            if mem_current > 8000:  # 8GB 内存警告阈值
+                print(f"   ⚠️  当前内存使用 {mem_current:.1f}MB，MPS 可能不稳定")
+                print(f"   💡 建议使用 --device cpu 或先释放内存")
+        
+        model.to(target_device)
+        print(f"   ✅ demucs loaded on device={target_device}")
+        
+    except Exception as e:
+        print(f"   ⚠️  demucs 无法使用 {device}: {e}")
+        print(f"   🔄 降级到 CPU...")
+        target_device = "cpu"
+        model.to(target_device)
+        print(f"   ✅ demucs loaded on device={target_device}")
+    
     model.eval()
+    
+    # 设置为不计算梯度模式以节省内存
+    for param in model.parameters():
+        param.requires_grad = False
+    
     _demucs_model = model
+    _demucs_device = target_device
+    
+    mem_after = _memory_usage_mb()
+    print(f"   📊 模型加载后内存: {mem_after:.1f} MB (+{mem_after-mem_before:.1f} MB)")
+    
     return model
 
 
@@ -361,80 +638,166 @@ def separate_vocals(
     *,
     device: str = "cpu",
     target_sr: int = 16000,
+    max_length_sec: int = 300,  # 最大处理长度：5分钟
 ) -> None:
     """用 demucs 从音频中提取纯净人声。
 
     输入: 任意 WAV
     输出: mono WAV @ target_sr（默认 16 kHz，可直接喂 Whisper）
+    支持长音频分块处理以防止内存耗尽。
     """
     import torch
     import torchaudio
     from demucs.apply import apply_model
 
+    mem_before = _memory_usage_mb()
+    print(f"   🎵 开始人声分离，内存使用: {mem_before:.1f} MB")
+    
     model = _load_demucs(device)
     model_sr = model.samplerate  # htdemucs: 44100
 
     # 确定模型实际所在的设备
     model_device = next(model.parameters()).device
+    device_str = str(model_device).lower()
 
-    wav, sr = torchaudio.load(input_wav)
+    try:
+        # 加载音频
+        wav, sr = torchaudio.load(input_wav)
+        
+        # 检查音频长度
+        duration_sec = wav.shape[-1] / sr
+        print(f"   📏 音频长度: {duration_sec:.1f} 秒")
+        
+        # 预处理：格式化为立体声
+        if wav.dim() == 1:
+            wav = wav.unsqueeze(0)
+        if wav.shape[0] == 1:
+            wav = wav.repeat(2, 1)
+        elif wav.shape[0] > 2:
+            wav = wav[:2]
 
-    # demucs 需要立体声输入
-    if wav.dim() == 1:
-        wav = wav.unsqueeze(0)
-    if wav.shape[0] == 1:
-        wav = wav.repeat(2, 1)
-    elif wav.shape[0] > 2:
-        wav = wav[:2]
+        # resample 到模型期望的采样率（在 CPU 上做）
+        if sr != model_sr:
+            print(f"   🔄 重采样: {sr} Hz -> {model_sr} Hz")
+            wav = torchaudio.transforms.Resample(sr, model_sr)(wav)
+            sr = model_sr
 
-    # resample 到模型期望的采样率（在 CPU 上做，避免 MPS Resample 兼容问题）
-    if sr != model_sr:
-        wav = torchaudio.transforms.Resample(sr, model_sr)(wav)
+        # 对于过长的音频，使用分块处理
+        max_samples = int(max_length_sec * sr)
+        if wav.shape[-1] > max_samples:
+            print(f"   ⚠️  音频过长 ({duration_sec:.1f}s)，使用分块处理")
+            return _separate_vocals_chunked(wav, output_wav, model, model_device, target_sr, max_samples)
+        
+        # 正常处理流程
+        return _separate_vocals_single(wav, output_wav, model, model_device, target_sr)
+        
+    except Exception as e:
+        print(f"   ❌ 人声分离过程错误: {e}")
+        raise
+    finally:
+        # 严格的内存清理
+        _cleanup_gpu_memory(device_str)
+        mem_after = _memory_usage_mb()
+        print(f"   🧹 人声分离完成，内存使用: {mem_after:.1f} MB")
+        
+        # 内存使用过高警告
+        if "mps" in device_str and mem_after > 10000:  # 10GB
+            print(f"   ⚠️  MPS 内存使用过高: {mem_after:.1f} MB")
+            print(f"   💡 建议重启进程或切换到 CPU 模式")
 
-    # 归一化（先在 CPU 上算好，再一起移到设备上）
+
+def _separate_vocals_single(wav, output_wav, model, model_device, target_sr):
+    """单个音频片段的人声分离。"""
+    import torch
+    import torchaudio
+    from demucs.apply import apply_model
+    
+    # 归一化（在 CPU 上）
     ref = wav.mean(0)
     wav_mean = ref.mean()
     wav_std = ref.std() + 1e-8
     wav_norm = (wav - wav_mean) / wav_std
 
-    # 把输入移到和模型相同的设备上
-    wav_input = wav_norm.unsqueeze(0).to(model_device)
+    # 移动到設備並处理
+    wav_input = wav_norm.unsqueeze(0).to(model_device, non_blocking=True)
+    
+    try:
+        with torch.inference_mode():
+            sources = apply_model(model, wav_input)
+        
+        # 提取人声 (最后一个source是vocals)
+        vocals = sources[0, -1].cpu()  # 立即移回 CPU
+        del sources  # 立即删除
+        
+    finally:
+        # 确保输入tensor被删除
+        if 'wav_input' in locals():
+            del wav_input
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
-    with torch.inference_mode():
-        sources = apply_model(
-            model,
-            wav_input,
-            device=model_device,
-        )
+    # 后处理（在 CPU 上）
+    vocals = vocals.detach()  # 确保没有梯度
+    vocals = vocals * wav_std + wav_mean  # 反归一化
+    vocals = vocals.mean(0, keepdim=True)  # stereo -> mono
 
-    # sources: (batch=1, num_sources, 2, samples)
-    # htdemucs source 顺序: drums, bass, other, vocals
-    vocals = sources[0, -1].cpu()  # (2, samples) — 移回 CPU
-    del sources, wav_input
+    # 重采样到目标采样率
+    if model.samplerate != target_sr:
+        vocals = torchaudio.transforms.Resample(model.samplerate, target_sr)(vocals)
 
-    # 反归一化
-    vocals = vocals * wav_std + wav_mean
-    # stereo → mono
-    vocals = vocals.mean(0, keepdim=True)
-
-    # resample 到目标采样率（在 CPU 上做）
-    if model_sr != target_sr:
-        vocals = torchaudio.transforms.Resample(model_sr, target_sr)(vocals)
-
-    torchaudio.save(output_wav, vocals.cpu(), target_sr)
-
-    # 及时释放显存
+    # 保存结果
+    torchaudio.save(output_wav, vocals, target_sr)
+    
+    # 清理局部变量
     del wav_norm, wav, vocals, ref
     gc.collect()
-    try:
-        import torch as _torch
-        dev_str = str(model_device)
-        if "cuda" in dev_str and _torch.cuda.is_available():
-            _torch.cuda.empty_cache()
-        elif "mps" in dev_str and hasattr(_torch, "mps"):
-            _torch.mps.empty_cache()
-    except Exception:
-        pass
+
+
+def _separate_vocals_chunked(wav, output_wav, model, model_device, target_sr, chunk_size):
+    """分块处理长音频的人声分离。"""
+    import torch
+    import torchaudio
+    
+    print(f"   📦 分块处理，块大小: {chunk_size / model.samplerate:.1f} 秒")
+    
+    all_vocals = []
+    num_chunks = (wav.shape[-1] + chunk_size - 1) // chunk_size
+    
+    for i in range(num_chunks):
+        start_idx = i * chunk_size
+        end_idx = min((i + 1) * chunk_size, wav.shape[-1])
+        chunk = wav[:, start_idx:end_idx]
+        
+        print(f"   📦 处理块 {i+1}/{num_chunks}...")
+        
+        # 临时文件用于单个块的处理
+        chunk_output = f"{output_wav}.chunk{i}.wav"
+        
+        try:
+            _separate_vocals_single(chunk, chunk_output, model, model_device, target_sr)
+            
+            # 读取处理结果
+            chunk_vocals, _ = torchaudio.load(chunk_output)
+            all_vocals.append(chunk_vocals)
+            
+            # 删除临时文件
+            os.remove(chunk_output)
+            
+        except Exception as e:
+            print(f"   ❌ 块 {i+1} 处理失败: {e}")
+            if os.path.exists(chunk_output):
+                os.remove(chunk_output)
+            raise
+        
+        # 强制内存清理
+        _cleanup_gpu_memory(str(model_device))
+    
+    # 合并所有块
+    final_vocals = torch.cat(all_vocals, dim=1)
+    torchaudio.save(output_wav, final_vocals, target_sr)
+    
+    # 清理
+    del all_vocals, final_vocals
+    gc.collect()
 
 
 # ---------------------------------------------------------------------------
@@ -453,15 +816,24 @@ def main() -> None:
     p.add_argument("--whisper_sr", type=int, default=16000, help="Whisper 输入采样率")
     p.add_argument(
         "--backend",
-        choices=["faster-whisper", "whisper-cli"],
-        default="faster-whisper",
-        help="转写后端（whisper-cli 原生支持 MPS/Metal 加速）",
+        choices=["faster-whisper", "whisper-cli", "mlx-whisper"],
+        default="mlx-whisper",
+        help=(
+            "转写后端：mlx-whisper（Apple Silicon Metal GPU 加速，推荐 macOS）、"
+            "faster-whisper（CPU/CUDA）、whisper-cli（whisper.cpp + Metal/CUDA）"
+        ),
     )
-    p.add_argument("--model_size", default="large-v3", help="faster-whisper 模型尺寸")
+    p.add_argument(
+        "--model_size", default="large-v3",
+        help="模型尺寸（如 tiny/base/small/medium/large-v3/large-v3-turbo）",
+    )
     p.add_argument(
         "--device",
-        default="mps",
-        help="计算设备: mps/cuda/cpu（faster-whisper 不支持 mps 会自动降级 CPU）",
+        default="cpu",
+        help=(
+            "计算设备: mps/cuda/cpu（仅 faster-whisper 和 demucs 使用；"
+            "mlx-whisper 自动使用 Apple Metal GPU，无需指定）"
+        ),
     )
     p.add_argument(
         "--language",
@@ -476,6 +848,23 @@ def main() -> None:
         "--speech_enhance",
         action="store_true",
         help="使用 demucs 分离纯净人声后再转写（需 pip install demucs）",
+    )
+    p.add_argument(
+        "--no_halluc_filter",
+        action="store_true",
+        help="禁用幻觉过滤器（默认会去除连续重复 >3 次的相同文本）",
+    )
+    p.add_argument(
+        "--max_audio_length",
+        type=int,
+        default=300,
+        help="音频分块的最大长度（秒），用于避免内存溢出（默认: 300秒）",
+    )
+    p.add_argument(
+        "--memory_limit_gb",
+        type=int,
+        default=20,
+        help="内存使用警告阈值（GB），超过此阈值将强制清理（默认: 20GB）",
     )
 
     args = parser.parse_args()
@@ -497,7 +886,15 @@ def main() -> None:
 
     # ── 预加载模型（全局复用，避免每个视频重新加载）─────────────
     fw_model = None
-    if args.backend == "faster-whisper":
+    if args.backend == "mlx-whisper":
+        if mlx_whisper is None:
+            raise RuntimeError(
+                "mlx-whisper 未安装；请 pip install mlx-whisper\n"
+                "注意：仅支持 Apple Silicon Mac（M1/M2/M3/M4）"
+            )
+        repo = _resolve_mlx_model(args.model_size)
+        print(f"🍎 Loading mlx-whisper model ({repo}) on Apple Metal GPU...")
+    elif args.backend == "faster-whisper":
         if WhisperModel is None:
             raise RuntimeError(
                 "faster-whisper 未安装；请 pip install faster-whisper"
@@ -522,102 +919,217 @@ def main() -> None:
         _load_demucs(args.device)
 
     # ── 逐视频处理 ────────────────────────────────────────────
-    for video_path in tqdm(videos, desc="Videos"):
+    failed_videos = []
+    success_count = 0
+    
+    # 初始内存状态
+    initial_memory = _memory_usage_mb()
+    print(f"🏃 开始处理 {len(videos)} 个视频，初始内存: {initial_memory:.1f} MB")
+    
+    for video_idx, video_path in enumerate(tqdm(videos, desc="Videos"), 1):
         tag = safe_stem(video_path)
         video_abs = os.path.abspath(video_path)
         video_rel = relpath_if_possible(video_abs, input_root)
-
-        # Step 1: 提取音频到临时 WAV（16 kHz mono PCM）
-        tmp_raw = os.path.join(tmp_dir, f"{tag}.raw.wav")
-        extract_audio(
-            video_path, tmp_raw, sample_rate=args.whisper_sr, mono=True
-        )
-        whisper_input = tmp_raw
-
-        # Step 2（可选）: demucs 人声分离
-        tmp_vocals = os.path.join(tmp_dir, f"{tag}.vocals.wav")
-        if args.speech_enhance:
+        
+        # 视频处理前的内存检查
+        mem_before_video = _memory_usage_mb()
+        memory_limit_mb = args.memory_limit_gb * 1024  # 转换为 MB
+        if mem_before_video > memory_limit_mb:
+            print(f"⚠️  内存使用过高: {mem_before_video:.1f} MB (阈值: {memory_limit_mb} MB)，强制清理...")
+            _cleanup_gpu_memory(args.device)
+            
+            # 清理后仍然过高，考虑重启处理
+            mem_after_cleanup = _memory_usage_mb()
+            if mem_after_cleanup > memory_limit_mb * 0.75:  # 75% 阈值
+                print(f"❌ 内存泄漏严重 ({mem_after_cleanup:.1f} MB)，建议重启进程")
+                print(f"💡 可以使用 retry_failed.py 继续处理剩余视频")
+                break
+        
+        try:
+            tqdm.write(f"📹 Processing {video_idx}/{len(videos)}: {video_path}")
+            tqdm.write(f"   💾 当前内存: {mem_before_video:.1f} MB")
+            
+            # Step 1: 提取音频到临时 WAV（16 kHz mono PCM）
+            tmp_raw = os.path.join(tmp_dir, f"{tag}.raw.wav")
             try:
-                tqdm.write(f"   🎵 Separating vocals: {tag}")
-                separate_vocals(
-                    tmp_raw,
-                    tmp_vocals,
-                    device=args.device,
-                    target_sr=args.whisper_sr,
-                )
-                whisper_input = tmp_vocals
-            except Exception as e:
-                tqdm.write(
-                    f"   ⚠️  Vocal separation failed for {tag}: {e}\n"
-                    f"   → Falling back to original audio"
+                extract_audio(
+                    video_path, tmp_raw, sample_rate=args.whisper_sr, mono=True
                 )
                 whisper_input = tmp_raw
+            except RuntimeError as e:
+                tqdm.write(f"❌ 音频提取失败 - {tag}: {e}")
+                failed_videos.append((video_path, f"音频提取失败: {e}"))
+                continue
 
-        # Step 3: 转写
-        if args.backend == "faster-whisper":
-            segs, transcribe_info = transcribe_faster_whisper(
-                whisper_input,
-                fw_model=fw_model,
-                model_size=args.model_size,
-                device=args.device,
-                language=args.language,
-                translate=bool(args.translate),
-                vad_filter=not bool(args.no_vad),
-            )
-        else:
-            segs, transcribe_info = transcribe_whisper_cli(
-                whisper_input,
-                model_path=args.whisper_cli_model,
-                language=args.language,
-                translate=bool(args.translate),
-            )
-
-        # 清理临时文件
-        if not args.keep_tmp:
-            for tmp_f in [tmp_raw, tmp_vocals]:
+            # Step 2（可选）: demucs 人声分离
+            tmp_vocals = os.path.join(tmp_dir, f"{tag}.vocals.wav")
+            if args.speech_enhance:
                 try:
-                    if os.path.exists(tmp_f):
-                        os.remove(tmp_f)
-                except OSError:
-                    pass
+                    tqdm.write(f"   🎵 Separating vocals: {tag}")
+                    separate_vocals(
+                        tmp_raw,
+                        tmp_vocals,
+                        device=args.device,
+                        target_sr=args.whisper_sr,
+                        max_length_sec=args.max_audio_length,
+                    )
+                    whisper_input = tmp_vocals
+                    
+                    # 人声分离后立即清理
+                    _cleanup_gpu_memory(args.device)
+                    
+                except Exception as e:
+                    tqdm.write(
+                        f"   ⚠️  Vocal separation failed for {tag}: {e}\n"
+                        f"   → Falling back to original audio"
+                    )
+                    whisper_input = tmp_raw
 
-        # Step 4: 写 SRT
-        write_srt(segs, os.path.join(srt_dir, f"{tag}.srt"))
+            # Step 3: 转写
+            try:
+                if args.backend == "mlx-whisper":
+                    segs, transcribe_info = transcribe_mlx_whisper(
+                        whisper_input,
+                        model_size=args.model_size,
+                        language=args.language,
+                        translate=bool(args.translate),
+                    )
+                elif args.backend == "faster-whisper":
+                    segs, transcribe_info = transcribe_faster_whisper(
+                        whisper_input,
+                        fw_model=fw_model,
+                        model_size=args.model_size,
+                        device=args.device,
+                        language=args.language,
+                        translate=bool(args.translate),
+                        vad_filter=not bool(args.no_vad),
+                    )
+                else:
+                    segs, transcribe_info = transcribe_whisper_cli(
+                        whisper_input,
+                        model_path=args.whisper_cli_model,
+                        language=args.language,
+                        translate=bool(args.translate),
+                    )
+            except Exception as e:
+                tqdm.write(f"❌ 转写失败 - {tag}: {e}")
+                failed_videos.append((video_path, f"转写失败: {e}"))
+                continue
 
-        # Step 5: 生成 utt_id + 保存 segments JSON
-        id_seed_prefix = video_rel if video_rel is not None else video_abs
-        enriched: List[Dict[str, Any]] = []
-        for s in segs:
-            start = float(s["start"])
-            end = float(s["end"])
-            text = str(s.get("text", "")).strip()
-            seed = f"{id_seed_prefix}|{start:.3f}|{end:.3f}|{text}"
-            utt_id = str(uuid.uuid5(uuid.NAMESPACE_URL, seed))
-            enriched.append({
-                "utt_id": utt_id,
-                "start": start,
-                "end": end,
-                "text": text,
-            })
+            # Step 3.5: 幻觉过滤（去除 whisper 重复输出）
+            if not args.no_halluc_filter:
+                segs = _filter_hallucinations(segs, max_repeat=3)
 
-        _save_segments_json(
-            os.path.join(seg_dir, f"{tag}.json"),
-            {
-                "input_root": input_root,
-                "video_abs": video_abs,
-                "video_rel": video_rel,
-                "backend": args.backend,
-                "whisper_sr": int(args.whisper_sr),
-                "language_requested": args.language,
-                "language_detected": transcribe_info.get("language_detected"),
-                "language_probability": transcribe_info.get(
-                    "language_probability"
-                ),
-                "translate": bool(args.translate),
-                "speech_enhance": bool(args.speech_enhance),
-                "segments": enriched,
-            },
-        )
+            # Step 4: 写 SRT
+            try:
+                write_srt(segs, os.path.join(srt_dir, f"{tag}.srt"))
+            except Exception as e:
+                tqdm.write(f"❌ SRT 写入失败 - {tag}: {e}")
+                failed_videos.append((video_path, f"SRT 写入失败: {e}"))
+                continue
+
+            # 清理临时文件
+            if not args.keep_tmp:
+                for tmp_f in [tmp_raw, tmp_vocals]:
+                    try:
+                        if os.path.exists(tmp_f):
+                            os.remove(tmp_f)
+                    except OSError:
+                        pass
+
+            # Step 5: 生成 utt_id + 保存 segments JSON
+            try:
+                id_seed_prefix = video_rel if video_rel is not None else video_abs
+                enriched: List[Dict[str, Any]] = []
+                for s in segs:
+                    start = float(s["start"])
+                    end = float(s["end"])
+                    text = str(s.get("text", "")).strip()
+                    seed = f"{id_seed_prefix}|{start:.3f}|{end:.3f}|{text}"
+                    utt_id = str(uuid.uuid5(uuid.NAMESPACE_URL, seed))
+                    enriched.append({
+                        "utt_id": utt_id,
+                        "start": start,
+                        "end": end,
+                        "text": text,
+                    })
+
+                _save_segments_json(
+                    os.path.join(seg_dir, f"{tag}.json"),
+                    {
+                        "input_root": input_root,
+                        "video_abs": video_abs,
+                        "video_rel": video_rel,
+                        "backend": args.backend,
+                        "whisper_sr": int(args.whisper_sr),
+                        "language_requested": args.language,
+                        "language_detected": transcribe_info.get("language_detected"),
+                        "language_probability": transcribe_info.get(
+                            "language_probability"
+                        ),
+                        "translate": bool(args.translate),
+                        "speech_enhance": bool(args.speech_enhance),
+                        "segments": enriched,
+                    },
+                )
+                
+                success_count += 1
+                tqdm.write(f"✅ 完成: {tag}")
+                
+            except Exception as e:
+                tqdm.write(f"❌ JSON 保存失败 - {tag}: {e}")
+                failed_videos.append((video_path, f"JSON 保存失败: {e}"))
+                continue
+                
+        except Exception as e:
+            # 捕获整个处理流程中的任何未预期错误
+            tqdm.write(f"❌ 处理失败 - {tag}: {e}")
+            failed_videos.append((video_path, f"未知错误: {e}"))
+            continue
+        
+        finally:
+            # 清理临时文件（始终执行）
+            if not args.keep_tmp:
+                for tmp_f in [tmp_raw, tmp_vocals]:
+                    try:
+                        if 'tmp_f' in locals() and os.path.exists(tmp_f):
+                            os.remove(tmp_f)
+                    except OSError:
+                        pass
+            
+            # 每个视频处理完成后强制内存清理
+            _cleanup_gpu_memory(args.device)
+            
+            # 内存状态报告
+            mem_after_video = _memory_usage_mb()
+            mem_growth = mem_after_video - mem_before_video
+            tqdm.write(f"   📊 内存变化: {mem_before_video:.1f} -> {mem_after_video:.1f} MB ({mem_growth:+.1f} MB)")
+            
+            # 内存泄漏警告
+            if mem_growth > 1000:  # 单个视频增长超过1GB
+                tqdm.write(f"   ⚠️  检测到潜在内存泄漏: +{mem_growth:.1f} MB")
+            
+            # 定期深度清理（MPS特别需要）
+            if video_idx % 5 == 0 and "mps" in args.device.lower():
+                tqdm.write(f"   🧹 执行定期深度清理 (第 {video_idx} 个视频)...")
+                
+                # 更激进的 MPS 清理
+                try:
+                    import torch
+                    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                        # 清空 MPS 缓存
+                        torch.mps.empty_cache()
+                        if hasattr(torch.mps, 'synchronize'):
+                            torch.mps.synchronize()
+                        
+                        # 强制垃圾回收多次
+                        for _ in range(3):
+                            gc.collect()
+                        
+                        mem_after_deep_clean = _memory_usage_mb()
+                        tqdm.write(f"   🧹 深度清理完成: {mem_after_video:.1f} -> {mem_after_deep_clean:.1f} MB")
+                except Exception as e:
+                    tqdm.write(f"   ⚠️  深度清理失败: {e}")
 
     # ── 收尾 ──────────────────────────────────────────────────
     if not args.keep_tmp:
@@ -627,13 +1139,75 @@ def main() -> None:
         except OSError:
             pass
 
-    # 释放模型
-    global _demucs_model
+    # 释放模型和清理内存
+    final_memory_before = _memory_usage_mb()
+    print(f"\n🧹 最终清理，当前内存: {final_memory_before:.1f} MB")
+    
+    global _demucs_model, _demucs_device
     if _demucs_model is not None:
+        print("   📤 释放 demucs 模型...")
+        del _demucs_model
         _demucs_model = None
+        _demucs_device = None
+        
+    # 强制清理所有缓存
+    _cleanup_gpu_memory(args.device)
+    
+    # 多轮垃圾回收 (对MPS特别有效)
+    for i in range(3):
         gc.collect()
-
-    print("✅ Transcription ready:", args.out_dir)
+    
+    final_memory_after = _memory_usage_mb()
+    memory_freed = final_memory_before - final_memory_after
+    print(f"   ✅ 最终清理完成: {final_memory_after:.1f} MB (释放了 {memory_freed:.1f} MB)")
+    
+    # 内存泄漏检测
+    total_memory_growth = final_memory_after - initial_memory
+    print(f"   📈 总内存变化: {initial_memory:.1f} -> {final_memory_after:.1f} MB ({total_memory_growth:+.1f} MB)")
+    
+    if total_memory_growth > 2000:  # 2GB 总增长警告
+        print(f"   ⚠️  检测到显著内存增长: +{total_memory_growth:.1f} MB")
+        print(f"   💡 建议重启进程或检查是否有内存泄漏")
+    
+    # ── 处理结果总结 ──────────────────────────────────────────
+    total_videos = len(videos)
+    print(f"\n📊 处理完成统计:")
+    print(f"  总视频数: {total_videos}")
+    print(f"  成功处理: {success_count}")
+    print(f"  失败数量: {len(failed_videos)}")
+    
+    if failed_videos:
+        print(f"\n❌ 失败的视频:")
+        for video_path, error in failed_videos:
+            print(f"  - {video_path}")
+            print(f"    错误: {error}")
+        
+        # 将失败信息保存到文件
+        failed_log_path = os.path.join(args.out_dir, "failed_videos.json")
+        with open(failed_log_path, "w", encoding="utf-8") as f:
+            json.dump({
+                "timestamp": str(uuid.uuid4()),
+                "total_videos": total_videos,
+                "success_count": success_count,
+                "failed_count": len(failed_videos),
+                "failed_videos": [{
+                    "path": path,
+                    "error": error
+                } for path, error in failed_videos]
+            }, f, ensure_ascii=False, indent=2)
+        
+        print(f"\n💾 失败日志已保存到: {failed_log_path}")
+        print(f"\n💡 提示: 可以检查失败原因，修复问题后重新运行失败的视频")
+    
+    if success_count > 0:
+        print(f"\n✅ 转写完成! 输出目录: {args.out_dir}")
+        if success_count < total_videos:
+            print(f"   部分成功: {success_count}/{total_videos} 个视频处理成功")
+    else:
+        print(f"\n❌ 没有视频成功处理")
+        return 1
+    
+    return 0
 
 
 if __name__ == "__main__":
