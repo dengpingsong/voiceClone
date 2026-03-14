@@ -113,7 +113,21 @@ python3 whisperVideo.py transcribe \
   --backend whisper-cli \
   --whisper_cli_model ~/models/ggml-base.bin \
   --language ja
+
+# CUDA / GPU 单线程转写时，允许 tmp 目录最多预取 3 个待处理音频
+python3 whisperVideo.py transcribe \
+  --input /Users/apple/Desktop/videos \
+  --out_dir out \
+  --backend faster-whisper \
+  --device cuda \
+  --workers 8 \
+  --tmp_backlog 3
 ```
+
+说明：
+- 脚本启动时会先扫描 out/srts 和 out/segments；若某视频两者都已存在，则视为已完成并自动跳过。
+- 会额外写出 out/transcribe_progress.json，记录当前已完成、待处理、失败的视频，方便中断后恢复。
+- 在 GPU 串行转写场景下，--workers 不再表示同时启动多少个 ffmpeg；ffmpeg 提取改为单线程预取，真正控制 tmp 目录积压量的是 --tmp_backlog。
 
 ## Step 2) 导出 manifest（元数据引用，不保存 wav）
 

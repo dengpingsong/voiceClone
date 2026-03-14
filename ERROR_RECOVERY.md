@@ -12,10 +12,17 @@
 ### 2. 失败视频跟踪
 
 - **失败日志**: 自动生成 `out/failed_videos.json` 记录失败的视频
+- **进度快照**: 自动生成 `out/transcribe_progress.json` 记录已完成/待处理/失败的视频
 - **分类统计**: 按错误类型统计失败原因
 - **处理报告**: 显示成功/失败数量统计
 
-### 3. 重试工具
+### 3. 启动恢复
+
+- **自动恢复已完成项**: 启动时扫描 `out/srts` 和 `out/segments`
+- **完成判定**: 同名 `.srt` 和 `.json` 同时存在时，视为该视频已完成
+- **恢复行为**: 已完成的视频会直接跳过，只继续处理剩余视频
+
+### 4. 重试工具
 
 使用 `retry_failed.py` 脚本重试失败的视频：
 
@@ -63,6 +70,8 @@ python3 whisperVideo.py transcribe --input "/Volumes/外置硬盘/视频资料/*
 # 程序会显示类似输出：
 📊 处理完成统计:
   总视频数: 5
+   已恢复完成: 1
+   本次新完成: 2
   成功处理: 3  
   失败数量: 2
 
@@ -74,6 +83,21 @@ python3 whisperVideo.py transcribe --input "/Volumes/外置硬盘/视频资料/*
 
 💾 失败日志已保存到: out/failed_videos.json
 ```
+
+### 控制 tmp 目录积压数量
+```bash
+python3 whisperVideo.py transcribe \
+   --input "视频目录" \
+   --out_dir out \
+   --backend faster-whisper \
+   --device cuda \
+   --workers 8 \
+   --tmp_backlog 3
+```
+
+说明：
+- GPU 串行转写时，ffmpeg 提取改为单线程预取，减少多个 ffmpeg 同时读盘造成的随机 I/O。
+- `--tmp_backlog` 控制 `out/_tmp` 中最多保留多少个待处理音频文件。
 
 ### 重试失败的视频
 ```bash

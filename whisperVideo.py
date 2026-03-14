@@ -1,12 +1,20 @@
+'''
+python whisperVideo.py transcribe --input "E:\Telegram Desktop" --out_dir "E:/out" --device cuda  --backend faster-whisper --whisper_cli_model large-v3 --workers 4 --tmp_backlog 32
+python whisperVideo.py transcribe --input "F:\精 神小妹系列 tg频道收 集整理大合集 2T 5539V" --out_dir "F:\out" --device cuda  --backend faster-whisper --whisper_cli_model large-v3 --workers 4 --tmp_backlog 32 
+'''
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import gc
 import json
 import os
+import queue
 import re
 import subprocess
+import threading
 import uuid
 import warnings
 import psutil
+import shutil
 from typing import Any, Dict, List, Optional, Tuple
 
 from tqdm import tqdm
@@ -526,12 +534,409 @@ def _save_segments_json(out_path: str, payload: Dict[str, Any]) -> None:
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
 
+def _progress_file_path(out_dir: str) -> str:
+    return os.path.join(out_dir, "transcribe_progress.json")
+
+
+def _load_existing_progress(progress_path: str) -> Dict[str, Any]:
+    if not os.path.isfile(progress_path):
+        return {}
+
+    try:
+        with open(progress_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+
+    return {}
+
+
+def _discover_completed_videos(
+    videos: List[str],
+    *,
+    srt_dir: str,
+    seg_dir: str,
+) -> List[str]:
+    completed: List[str] = []
+    for video_path in videos:
+        tag = safe_stem(video_path)
+        srt_path = os.path.join(srt_dir, f"{tag}.srt")
+        seg_path = os.path.join(seg_dir, f"{tag}.json")
+        if os.path.isfile(srt_path) and os.path.isfile(seg_path):
+            completed.append(video_path)
+    return completed
+
+
+def _write_progress_snapshot(
+    out_dir: str,
+    *,
+    input_root: str,
+    total_videos: int,
+    completed_videos: List[str],
+    pending_videos: List[str],
+    failed_videos: List[Tuple[str, str]],
+) -> None:
+    progress_path = _progress_file_path(out_dir)
+    payload = {
+        "input_root": input_root,
+        "timestamp": str(uuid.uuid4()),
+        "total_videos": total_videos,
+        "completed_count": len(completed_videos),
+        "pending_count": len(pending_videos),
+        "failed_count": len(failed_videos),
+        "completed_videos": completed_videos,
+        "pending_videos": pending_videos,
+        "failed_videos": [
+            {"path": path, "error": error} for path, error in failed_videos
+        ],
+    }
+    with open(progress_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+
+def _remaining_pending_videos(
+    videos: List[str],
+    *,
+    completed_videos: List[str],
+    failed_videos: List[Tuple[str, str]],
+) -> List[str]:
+    completed_set = set(completed_videos)
+    failed_set = {path for path, _ in failed_videos}
+    return [
+        path for path in videos
+        if path not in completed_set and path not in failed_set
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Speech Enhancement — Vocal Separation via demucs
 # ---------------------------------------------------------------------------
 
 _demucs_model = None
 _demucs_device = None
+_thread_local = threading.local()
+
+
+def _remove_temp_files(*paths: str) -> None:
+    for path in paths:
+        try:
+            if path and os.path.exists(path):
+                os.remove(path)
+        except OSError:
+            pass
+
+
+def _get_thread_fw_model(model_size: str, device: str):
+    """为每个线程懒加载并缓存 faster-whisper 模型。"""
+    if WhisperModel is None:
+        raise RuntimeError("faster-whisper 未安装；请 pip install faster-whisper")
+
+    actual_device = _resolve_fw_device(device)
+    cache_key = (model_size, actual_device)
+    cached_key = getattr(_thread_local, "fw_model_key", None)
+    cached_model = getattr(_thread_local, "fw_model", None)
+
+    if cached_model is None or cached_key != cache_key:
+        cached_model = WhisperModel(
+            model_size,
+            device=actual_device,
+            compute_type=_guess_compute_type(actual_device),
+        )
+        _thread_local.fw_model = cached_model
+        _thread_local.fw_model_key = cache_key
+
+    return cached_model
+
+
+def _resolve_worker_plan(args: argparse.Namespace) -> Tuple[int, int, int]:
+    requested = max(1, int(args.workers))
+    process_workers = requested
+    raw_tmp_backlog = getattr(args, "tmp_backlog", None)
+    if raw_tmp_backlog is None:
+        raw_tmp_backlog = requested
+    tmp_backlog = max(1, int(raw_tmp_backlog))
+    prep_workers = 1
+
+    if requested == 1:
+        return prep_workers, process_workers, tmp_backlog
+
+    if args.backend == "mlx-whisper":
+        print("⚠️  mlx-whisper 阶段保留单线程；音频提取改为单生产者预取")
+        process_workers = 1
+    elif args.backend == "faster-whisper" and _resolve_fw_device(args.device) != "cpu":
+        print(
+            "⚠️  faster-whisper 的 GPU 转写阶段保留单线程；音频提取改为单生产者预取\n"
+            "   → tmp_backlog 控制 tmp 目录里最多积压多少个待处理音频"
+        )
+        process_workers = 1
+
+    if args.speech_enhance and requested > 1:
+        print("⚠️  demucs 仍在主处理阶段串行执行；仅保留有界音频预取")
+        process_workers = 1
+
+    if args.backend == "whisper-cli" and process_workers > 1:
+        print(
+            f"⚠️  whisper-cli 将并发启动 {process_workers} 个独立进程；如果 whisper.cpp 也走 GPU，显存占用会按并发数放大"
+        )
+    elif process_workers == 1 and requested > 1:
+        print(
+            f"ℹ️  已将 ffmpeg 提取改为单线程预取；tmp 待处理音频上限为 {tmp_backlog}"
+        )
+
+    return prep_workers, process_workers, tmp_backlog
+
+
+def _build_temp_audio_paths(video_path: str, tmp_dir: str) -> Tuple[str, str, str]:
+    tag = safe_stem(video_path)
+    video_abs = os.path.abspath(video_path)
+    temp_suffix = uuid.uuid5(uuid.NAMESPACE_URL, video_abs).hex[:8]
+    tmp_raw = os.path.join(tmp_dir, f"{tag}.{temp_suffix}.raw.wav")
+    tmp_vocals = os.path.join(tmp_dir, f"{tag}.{temp_suffix}.vocals.wav")
+    return tag, tmp_raw, tmp_vocals
+
+
+def _prepare_audio_input(
+    video_idx: int,
+    total_videos: int,
+    video_path: str,
+    *,
+    args: argparse.Namespace,
+    tmp_dir: str,
+) -> Dict[str, Any]:
+    tag, tmp_raw, tmp_vocals = _build_temp_audio_paths(video_path, tmp_dir)
+
+    try:
+        tqdm.write(f"🎞️ Extracting {video_idx}/{total_videos}: {video_path}")
+        extract_audio(video_path, tmp_raw, sample_rate=args.whisper_sr, mono=True)
+        return {
+            "ok": True,
+            "video_path": video_path,
+            "tag": tag,
+            "tmp_raw": tmp_raw,
+            "tmp_vocals": tmp_vocals,
+            "whisper_input": tmp_raw,
+        }
+    except Exception as e:
+        _remove_temp_files(tmp_raw, tmp_vocals)
+        return {
+            "ok": False,
+            "video_path": video_path,
+            "tag": tag,
+            "error": f"音频提取失败: {e}",
+        }
+
+
+def _iter_prepared_audio_jobs(
+    videos: List[str],
+    *,
+    args: argparse.Namespace,
+    tmp_dir: str,
+    prep_workers: int,
+    tmp_backlog: int,
+):
+    if prep_workers != 1:
+        raise RuntimeError("预取模式要求 prep_workers=1")
+
+    result_queue: "queue.Queue[Optional[Tuple[int, str, Dict[str, Any]]]]" = queue.Queue(
+        maxsize=max(1, tmp_backlog)
+    )
+
+    def _producer() -> None:
+        try:
+            for video_idx, video_path in enumerate(videos, 1):
+                prepared = _prepare_audio_input(
+                    video_idx,
+                    len(videos),
+                    video_path,
+                    args=args,
+                    tmp_dir=tmp_dir,
+                )
+                result_queue.put((video_idx, video_path, prepared))
+        finally:
+            result_queue.put(None)
+
+    producer = threading.Thread(
+        target=_producer,
+        name="extract-producer",
+        daemon=True,
+    )
+    producer.start()
+
+    while True:
+        item = result_queue.get()
+        if item is None:
+            break
+        yield item
+
+    producer.join()
+
+
+def _process_single_video(
+    video_idx: int,
+    total_videos: int,
+    video_path: str,
+    *,
+    args: argparse.Namespace,
+    input_root: str,
+    srt_dir: str,
+    seg_dir: str,
+    tmp_dir: str,
+    fw_model=None,
+    prepared_audio: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    tag, tmp_raw, tmp_vocals = _build_temp_audio_paths(video_path, tmp_dir)
+    video_abs = os.path.abspath(video_path)
+    video_rel = relpath_if_possible(video_abs, input_root)
+    mem_before_video = _memory_usage_mb()
+    memory_limit_mb = args.memory_limit_gb * 1024
+
+    if mem_before_video > memory_limit_mb:
+        tqdm.write(
+            f"⚠️  内存使用过高: {mem_before_video:.1f} MB (阈值: {memory_limit_mb} MB)，尝试清理缓存..."
+        )
+        _cleanup_gpu_memory(args.device)
+
+    try:
+        tqdm.write(f"📹 Processing {video_idx}/{total_videos}: {video_path}")
+        tqdm.write(f"   💾 当前内存: {mem_before_video:.1f} MB")
+
+        if prepared_audio is not None:
+            if not prepared_audio.get("ok"):
+                raise RuntimeError(str(prepared_audio.get("error", "音频提取失败")))
+            tmp_raw = prepared_audio.get("tmp_raw", tmp_raw)
+            tmp_vocals = prepared_audio.get("tmp_vocals", tmp_vocals)
+            whisper_input = prepared_audio.get("whisper_input", tmp_raw)
+        else:
+            try:
+                extract_audio(
+                    video_path, tmp_raw, sample_rate=args.whisper_sr, mono=True
+                )
+                whisper_input = tmp_raw
+            except RuntimeError as e:
+                raise RuntimeError(f"音频提取失败: {e}") from e
+
+        if args.speech_enhance:
+            try:
+                tqdm.write(f"   🎵 Separating vocals: {tag}")
+                separate_vocals(
+                    tmp_raw,
+                    tmp_vocals,
+                    device=args.device,
+                    target_sr=args.whisper_sr,
+                    max_length_sec=args.max_audio_length,
+                )
+                whisper_input = tmp_vocals
+                _cleanup_gpu_memory(args.device)
+            except Exception as e:
+                tqdm.write(
+                    f"   ⚠️  Vocal separation failed for {tag}: {e}\n"
+                    f"   → Falling back to original audio"
+                )
+                whisper_input = tmp_raw
+
+        try:
+            if args.backend == "mlx-whisper":
+                segs, transcribe_info = transcribe_mlx_whisper(
+                    whisper_input,
+                    model_size=args.model_size,
+                    language=args.language,
+                    translate=bool(args.translate),
+                )
+            elif args.backend == "faster-whisper":
+                current_fw_model = fw_model or _get_thread_fw_model(
+                    args.model_size,
+                    args.device,
+                )
+                segs, transcribe_info = transcribe_faster_whisper(
+                    whisper_input,
+                    fw_model=current_fw_model,
+                    model_size=args.model_size,
+                    device=args.device,
+                    language=args.language,
+                    translate=bool(args.translate),
+                    vad_filter=not bool(args.no_vad),
+                )
+            else:
+                segs, transcribe_info = transcribe_whisper_cli(
+                    whisper_input,
+                    model_path=args.whisper_cli_model,
+                    language=args.language,
+                    translate=bool(args.translate),
+                )
+        except Exception as e:
+            raise RuntimeError(f"转写失败: {e}") from e
+
+        if not args.no_halluc_filter:
+            segs = _filter_hallucinations(segs, max_repeat=3)
+
+        try:
+            write_srt(segs, os.path.join(srt_dir, f"{tag}.srt"))
+        except Exception as e:
+            raise RuntimeError(f"SRT 写入失败: {e}") from e
+
+        try:
+            id_seed_prefix = video_rel if video_rel is not None else video_abs
+            enriched: List[Dict[str, Any]] = []
+            for s in segs:
+                start = float(s["start"])
+                end = float(s["end"])
+                text = str(s.get("text", "")).strip()
+                seed = f"{id_seed_prefix}|{start:.3f}|{end:.3f}|{text}"
+                utt_id = str(uuid.uuid5(uuid.NAMESPACE_URL, seed))
+                enriched.append({
+                    "utt_id": utt_id,
+                    "start": start,
+                    "end": end,
+                    "text": text,
+                })
+
+            _save_segments_json(
+                os.path.join(seg_dir, f"{tag}.json"),
+                {
+                    "input_root": input_root,
+                    "video_abs": video_abs,
+                    "video_rel": video_rel,
+                    "backend": args.backend,
+                    "whisper_sr": int(args.whisper_sr),
+                    "language_requested": args.language,
+                    "language_detected": transcribe_info.get("language_detected"),
+                    "language_probability": transcribe_info.get(
+                        "language_probability"
+                    ),
+                    "translate": bool(args.translate),
+                    "speech_enhance": bool(args.speech_enhance),
+                    "segments": enriched,
+                },
+            )
+        except Exception as e:
+            raise RuntimeError(f"JSON 保存失败: {e}") from e
+
+        tqdm.write(f"✅ 完成: {tag}")
+        return {"ok": True, "video_path": video_path, "tag": tag}
+
+    except Exception as e:
+        tqdm.write(f"❌ 处理失败 - {tag}: {e}")
+        return {
+            "ok": False,
+            "video_path": video_path,
+            "tag": tag,
+            "error": str(e),
+        }
+    finally:
+        if not args.keep_tmp:
+            _remove_temp_files(tmp_raw, tmp_vocals)
+
+        _cleanup_gpu_memory(args.device)
+        mem_after_video = _memory_usage_mb()
+        mem_growth = mem_after_video - mem_before_video
+        tqdm.write(
+            f"   📊 内存变化: {mem_before_video:.1f} -> {mem_after_video:.1f} MB ({mem_growth:+.1f} MB)"
+        )
+
+        if mem_growth > 1000:
+            tqdm.write(f"   ⚠️  检测到潜在内存泄漏: +{mem_growth:.1f} MB")
 
 
 def _memory_usage_mb():
@@ -866,6 +1271,18 @@ def main() -> None:
         default=20,
         help="内存使用警告阈值（GB），超过此阈值将强制清理（默认: 20GB）",
     )
+    p.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="并发处理视频的线程数；建议 4-16 仅用于 whisper-cli 或 CPU 模式（默认: 1）",
+    )
+    p.add_argument(
+        "--tmp_backlog",
+        type=int,
+        default=None,
+        help="tmp 目录里允许同时积压的待处理音频数量；默认等于 --workers",
+    )
 
     args = parser.parse_args()
     ensure_ffmpeg()
@@ -884,6 +1301,39 @@ def main() -> None:
     os.makedirs(seg_dir, exist_ok=True)
     os.makedirs(tmp_dir, exist_ok=True)
 
+    recovered_videos = _discover_completed_videos(
+        videos,
+        srt_dir=srt_dir,
+        seg_dir=seg_dir,
+    )
+    recovered_set = set(recovered_videos)
+    pending_videos = [video_path for video_path in videos if video_path not in recovered_set]
+
+    existing_progress = _load_existing_progress(_progress_file_path(args.out_dir))
+    if recovered_videos:
+        print(
+            f"♻️  从 output 恢复到 {len(recovered_videos)} 个已完成视频；本次待处理 {len(pending_videos)} 个"
+        )
+    elif existing_progress:
+        print("ℹ️  检测到已有 progress 文件，但当前 output 中没有完整产物可恢复")
+
+    prep_workers, process_workers, tmp_backlog = _resolve_worker_plan(args)
+
+    completed_videos = list(recovered_videos)
+    failed_videos: List[Tuple[str, str]] = []
+    _write_progress_snapshot(
+        args.out_dir,
+        input_root=input_root,
+        total_videos=len(videos),
+        completed_videos=completed_videos,
+        pending_videos=list(pending_videos),
+        failed_videos=failed_videos,
+    )
+
+    if not pending_videos:
+        print("✅ output 中已存在全部视频的 SRT 和 segments，本次无需继续转写")
+        return
+
     # ── 预加载模型（全局复用，避免每个视频重新加载）─────────────
     fw_model = None
     if args.backend == "mlx-whisper":
@@ -900,15 +1350,20 @@ def main() -> None:
                 "faster-whisper 未安装；请 pip install faster-whisper"
             )
         actual_device = _resolve_fw_device(args.device)
-        print(
-            f"📦 Loading faster-whisper model ({args.model_size}) "
-            f"on {actual_device}..."
-        )
-        fw_model = WhisperModel(
-            args.model_size,
-            device=actual_device,
-            compute_type=_guess_compute_type(actual_device),
-        )
+        if process_workers == 1:
+            print(
+                f"📦 Loading faster-whisper model ({args.model_size}) "
+                f"on {actual_device}..."
+            )
+            fw_model = WhisperModel(
+                args.model_size,
+                device=actual_device,
+                compute_type=_guess_compute_type(actual_device),
+            )
+        else:
+            print(
+                f"📦 faster-whisper 将在每个线程内懒加载模型 ({args.model_size}, device={actual_device})"
+            )
     elif args.backend == "whisper-cli":
         if not args.whisper_cli_model:
             raise RuntimeError(
@@ -919,217 +1374,126 @@ def main() -> None:
         _load_demucs(args.device)
 
     # ── 逐视频处理 ────────────────────────────────────────────
-    failed_videos = []
-    success_count = 0
+    recovered_count = len(recovered_videos)
+    success_count = recovered_count
     
     # 初始内存状态
     initial_memory = _memory_usage_mb()
-    print(f"🏃 开始处理 {len(videos)} 个视频，初始内存: {initial_memory:.1f} MB")
-    
-    for video_idx, video_path in enumerate(tqdm(videos, desc="Videos"), 1):
-        tag = safe_stem(video_path)
-        video_abs = os.path.abspath(video_path)
-        video_rel = relpath_if_possible(video_abs, input_root)
-        
-        # 视频处理前的内存检查
-        mem_before_video = _memory_usage_mb()
-        memory_limit_mb = args.memory_limit_gb * 1024  # 转换为 MB
-        if mem_before_video > memory_limit_mb:
-            print(f"⚠️  内存使用过高: {mem_before_video:.1f} MB (阈值: {memory_limit_mb} MB)，强制清理...")
-            _cleanup_gpu_memory(args.device)
-            
-            # 清理后仍然过高，考虑重启处理
-            mem_after_cleanup = _memory_usage_mb()
-            if mem_after_cleanup > memory_limit_mb * 0.75:  # 75% 阈值
-                print(f"❌ 内存泄漏严重 ({mem_after_cleanup:.1f} MB)，建议重启进程")
-                print(f"💡 可以使用 retry_failed.py 继续处理剩余视频")
-                break
-        
-        try:
-            tqdm.write(f"📹 Processing {video_idx}/{len(videos)}: {video_path}")
-            tqdm.write(f"   💾 当前内存: {mem_before_video:.1f} MB")
-            
-            # Step 1: 提取音频到临时 WAV（16 kHz mono PCM）
-            tmp_raw = os.path.join(tmp_dir, f"{tag}.raw.wav")
-            try:
-                extract_audio(
-                    video_path, tmp_raw, sample_rate=args.whisper_sr, mono=True
+    print(
+        f"🏃 开始处理 {len(pending_videos)}/{len(videos)} 个待处理视频，初始内存: {initial_memory:.1f} MB，"
+        f"prep_workers={prep_workers}, process_workers={process_workers}, tmp_backlog={tmp_backlog}"
+    )
+
+    if process_workers == 1 and tmp_backlog > 1:
+        with tqdm(total=len(pending_videos), desc="Videos") as progress:
+            for video_idx, video_path, prepared_audio in _iter_prepared_audio_jobs(
+                pending_videos,
+                args=args,
+                tmp_dir=tmp_dir,
+                prep_workers=prep_workers,
+                tmp_backlog=tmp_backlog,
+            ):
+                result = _process_single_video(
+                    video_idx,
+                    len(pending_videos),
+                    video_path,
+                    args=args,
+                    input_root=input_root,
+                    srt_dir=srt_dir,
+                    seg_dir=seg_dir,
+                    tmp_dir=tmp_dir,
+                    fw_model=fw_model,
+                    prepared_audio=prepared_audio,
                 )
-                whisper_input = tmp_raw
-            except RuntimeError as e:
-                tqdm.write(f"❌ 音频提取失败 - {tag}: {e}")
-                failed_videos.append((video_path, f"音频提取失败: {e}"))
-                continue
-
-            # Step 2（可选）: demucs 人声分离
-            tmp_vocals = os.path.join(tmp_dir, f"{tag}.vocals.wav")
-            if args.speech_enhance:
-                try:
-                    tqdm.write(f"   🎵 Separating vocals: {tag}")
-                    separate_vocals(
-                        tmp_raw,
-                        tmp_vocals,
-                        device=args.device,
-                        target_sr=args.whisper_sr,
-                        max_length_sec=args.max_audio_length,
-                    )
-                    whisper_input = tmp_vocals
-                    
-                    # 人声分离后立即清理
-                    _cleanup_gpu_memory(args.device)
-                    
-                except Exception as e:
-                    tqdm.write(
-                        f"   ⚠️  Vocal separation failed for {tag}: {e}\n"
-                        f"   → Falling back to original audio"
-                    )
-                    whisper_input = tmp_raw
-
-            # Step 3: 转写
-            try:
-                if args.backend == "mlx-whisper":
-                    segs, transcribe_info = transcribe_mlx_whisper(
-                        whisper_input,
-                        model_size=args.model_size,
-                        language=args.language,
-                        translate=bool(args.translate),
-                    )
-                elif args.backend == "faster-whisper":
-                    segs, transcribe_info = transcribe_faster_whisper(
-                        whisper_input,
-                        fw_model=fw_model,
-                        model_size=args.model_size,
-                        device=args.device,
-                        language=args.language,
-                        translate=bool(args.translate),
-                        vad_filter=not bool(args.no_vad),
-                    )
+                if result["ok"]:
+                    success_count += 1
+                    completed_videos.append(video_path)
                 else:
-                    segs, transcribe_info = transcribe_whisper_cli(
-                        whisper_input,
-                        model_path=args.whisper_cli_model,
-                        language=args.language,
-                        translate=bool(args.translate),
-                    )
-            except Exception as e:
-                tqdm.write(f"❌ 转写失败 - {tag}: {e}")
-                failed_videos.append((video_path, f"转写失败: {e}"))
-                continue
-
-            # Step 3.5: 幻觉过滤（去除 whisper 重复输出）
-            if not args.no_halluc_filter:
-                segs = _filter_hallucinations(segs, max_repeat=3)
-
-            # Step 4: 写 SRT
-            try:
-                write_srt(segs, os.path.join(srt_dir, f"{tag}.srt"))
-            except Exception as e:
-                tqdm.write(f"❌ SRT 写入失败 - {tag}: {e}")
-                failed_videos.append((video_path, f"SRT 写入失败: {e}"))
-                continue
-
-            # 清理临时文件
-            if not args.keep_tmp:
-                for tmp_f in [tmp_raw, tmp_vocals]:
-                    try:
-                        if os.path.exists(tmp_f):
-                            os.remove(tmp_f)
-                    except OSError:
-                        pass
-
-            # Step 5: 生成 utt_id + 保存 segments JSON
-            try:
-                id_seed_prefix = video_rel if video_rel is not None else video_abs
-                enriched: List[Dict[str, Any]] = []
-                for s in segs:
-                    start = float(s["start"])
-                    end = float(s["end"])
-                    text = str(s.get("text", "")).strip()
-                    seed = f"{id_seed_prefix}|{start:.3f}|{end:.3f}|{text}"
-                    utt_id = str(uuid.uuid5(uuid.NAMESPACE_URL, seed))
-                    enriched.append({
-                        "utt_id": utt_id,
-                        "start": start,
-                        "end": end,
-                        "text": text,
-                    })
-
-                _save_segments_json(
-                    os.path.join(seg_dir, f"{tag}.json"),
-                    {
-                        "input_root": input_root,
-                        "video_abs": video_abs,
-                        "video_rel": video_rel,
-                        "backend": args.backend,
-                        "whisper_sr": int(args.whisper_sr),
-                        "language_requested": args.language,
-                        "language_detected": transcribe_info.get("language_detected"),
-                        "language_probability": transcribe_info.get(
-                            "language_probability"
-                        ),
-                        "translate": bool(args.translate),
-                        "speech_enhance": bool(args.speech_enhance),
-                        "segments": enriched,
-                    },
+                    failed_videos.append((video_path, result["error"]))
+                remaining = _remaining_pending_videos(
+                    pending_videos,
+                    completed_videos=completed_videos,
+                    failed_videos=failed_videos,
                 )
-                
+                _write_progress_snapshot(
+                    args.out_dir,
+                    input_root=input_root,
+                    total_videos=len(videos),
+                    completed_videos=completed_videos,
+                    pending_videos=remaining,
+                    failed_videos=failed_videos,
+                )
+                progress.update(1)
+    elif process_workers == 1:
+        for video_idx, video_path in enumerate(tqdm(pending_videos, desc="Videos"), 1):
+            result = _process_single_video(
+                video_idx,
+                len(pending_videos),
+                video_path,
+                args=args,
+                input_root=input_root,
+                srt_dir=srt_dir,
+                seg_dir=seg_dir,
+                tmp_dir=tmp_dir,
+                fw_model=fw_model,
+            )
+            if result["ok"]:
                 success_count += 1
-                tqdm.write(f"✅ 完成: {tag}")
-                
-            except Exception as e:
-                tqdm.write(f"❌ JSON 保存失败 - {tag}: {e}")
-                failed_videos.append((video_path, f"JSON 保存失败: {e}"))
-                continue
-                
-        except Exception as e:
-            # 捕获整个处理流程中的任何未预期错误
-            tqdm.write(f"❌ 处理失败 - {tag}: {e}")
-            failed_videos.append((video_path, f"未知错误: {e}"))
-            continue
-        
-        finally:
-            # 清理临时文件（始终执行）
-            if not args.keep_tmp:
-                for tmp_f in [tmp_raw, tmp_vocals]:
-                    try:
-                        if 'tmp_f' in locals() and os.path.exists(tmp_f):
-                            os.remove(tmp_f)
-                    except OSError:
-                        pass
-            
-            # 每个视频处理完成后强制内存清理
-            _cleanup_gpu_memory(args.device)
-            
-            # 内存状态报告
-            mem_after_video = _memory_usage_mb()
-            mem_growth = mem_after_video - mem_before_video
-            tqdm.write(f"   📊 内存变化: {mem_before_video:.1f} -> {mem_after_video:.1f} MB ({mem_growth:+.1f} MB)")
-            
-            # 内存泄漏警告
-            if mem_growth > 1000:  # 单个视频增长超过1GB
-                tqdm.write(f"   ⚠️  检测到潜在内存泄漏: +{mem_growth:.1f} MB")
-            
-            # 定期深度清理（MPS特别需要）
-            if video_idx % 5 == 0 and "mps" in args.device.lower():
-                tqdm.write(f"   🧹 执行定期深度清理 (第 {video_idx} 个视频)...")
-                
-                # 更激进的 MPS 清理
-                try:
-                    import torch
-                    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-                        # 清空 MPS 缓存
-                        torch.mps.empty_cache()
-                        if hasattr(torch.mps, 'synchronize'):
-                            torch.mps.synchronize()
-                        
-                        # 强制垃圾回收多次
-                        for _ in range(3):
-                            gc.collect()
-                        
-                        mem_after_deep_clean = _memory_usage_mb()
-                        tqdm.write(f"   🧹 深度清理完成: {mem_after_video:.1f} -> {mem_after_deep_clean:.1f} MB")
-                except Exception as e:
-                    tqdm.write(f"   ⚠️  深度清理失败: {e}")
+                completed_videos.append(video_path)
+            else:
+                failed_videos.append((video_path, result["error"]))
+            remaining = _remaining_pending_videos(
+                pending_videos,
+                completed_videos=completed_videos,
+                failed_videos=failed_videos,
+            )
+            _write_progress_snapshot(
+                args.out_dir,
+                input_root=input_root,
+                total_videos=len(videos),
+                completed_videos=completed_videos,
+                pending_videos=remaining,
+                failed_videos=failed_videos,
+            )
+    else:
+        with ThreadPoolExecutor(max_workers=process_workers, thread_name_prefix="transcribe") as executor:
+            future_to_video = {
+                executor.submit(
+                    _process_single_video,
+                    video_idx,
+                    len(pending_videos),
+                    video_path,
+                    args=args,
+                    input_root=input_root,
+                    srt_dir=srt_dir,
+                    seg_dir=seg_dir,
+                    tmp_dir=tmp_dir,
+                    fw_model=None,
+                ): video_path
+                for video_idx, video_path in enumerate(pending_videos, 1)
+            }
+
+            for future in tqdm(as_completed(future_to_video), total=len(future_to_video), desc="Videos"):
+                video_path = future_to_video[future]
+                result = future.result()
+                if result["ok"]:
+                    success_count += 1
+                    completed_videos.append(video_path)
+                else:
+                    failed_videos.append((video_path, result["error"]))
+                remaining = _remaining_pending_videos(
+                    pending_videos,
+                    completed_videos=completed_videos,
+                    failed_videos=failed_videos,
+                )
+                _write_progress_snapshot(
+                    args.out_dir,
+                    input_root=input_root,
+                    total_videos=len(videos),
+                    completed_videos=completed_videos,
+                    pending_videos=remaining,
+                    failed_videos=failed_videos,
+                )
 
     # ── 收尾 ──────────────────────────────────────────────────
     if not args.keep_tmp:
@@ -1171,8 +1535,11 @@ def main() -> None:
     
     # ── 处理结果总结 ──────────────────────────────────────────
     total_videos = len(videos)
+    new_success_count = success_count - recovered_count
     print(f"\n📊 处理完成统计:")
     print(f"  总视频数: {total_videos}")
+    print(f"  已恢复完成: {recovered_count}")
+    print(f"  本次新完成: {new_success_count}")
     print(f"  成功处理: {success_count}")
     print(f"  失败数量: {len(failed_videos)}")
     
@@ -1188,6 +1555,7 @@ def main() -> None:
             json.dump({
                 "timestamp": str(uuid.uuid4()),
                 "total_videos": total_videos,
+                "recovered_count": recovered_count,
                 "success_count": success_count,
                 "failed_count": len(failed_videos),
                 "failed_videos": [{
@@ -1197,6 +1565,17 @@ def main() -> None:
             }, f, ensure_ascii=False, indent=2)
         
         print(f"\n💾 失败日志已保存到: {failed_log_path}")
+
+    _write_progress_snapshot(
+        args.out_dir,
+        input_root=input_root,
+        total_videos=total_videos,
+        completed_videos=completed_videos,
+        pending_videos=[],
+        failed_videos=failed_videos,
+    )
+
+    if failed_videos:
         print(f"\n💡 提示: 可以检查失败原因，修复问题后重新运行失败的视频")
     
     if success_count > 0:

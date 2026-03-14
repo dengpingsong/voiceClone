@@ -65,9 +65,11 @@ def extract_audio(video_path: str, wav_path: str, *, sample_rate: int, mono: boo
     # 确保输出目录存在
     os.makedirs(os.path.dirname(wav_path), exist_ok=True)
     
+    # 尝试用CUDA加速视频解码（仅解码，编码仍为CPU）
     cmd = [
         "ffmpeg",
         "-y",
+        "-hwaccel", "cuda",
         "-i",
         video_path,  # ffmpeg 可以直接处理包含空格的路径
         "-vn",       # 不包含视频流
